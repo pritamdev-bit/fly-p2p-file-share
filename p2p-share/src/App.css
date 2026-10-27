@@ -574,6 +574,15 @@ button:focus-visible {
   font-variant-numeric: tabular-nums;
 }
 
+.receive-actions {
+  display: flex;
+  gap: 10px;
+}
+
+.receive-actions > button {
+  flex: 1;
+}
+
 .deliver-banner {
   align-items: center;
 }

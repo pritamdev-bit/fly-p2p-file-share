@@ -9,8 +9,16 @@ use crate::{
     events::TransferEvent,
     share::{self, ShareSession, TicketType},
 };
+use iroh::Endpoint;
 use serde::Serialize;
-use std::{path::Path, sync::Mutex};
+use std::{
+    path::Path,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 use tauri::{AppHandle, Manager, State, ipc::Channel};
 use tokio::sync::mpsc;
 
@@ -33,6 +41,44 @@ impl Default for ShareSlot {
     }
 }
 
+/// Control block for the running download. Lets `cancel_receive` stop it
+/// gracefully: closing the endpoint sends QUIC close frames, so the
+/// sender releases the receiver slot immediately instead of holding it
+/// until a connection timeout (which used to force 3-4 Resume clicks).
+#[derive(Default)]
+pub struct ReceiveControl {
+    endpoint: Mutex<Option<Endpoint>>,
+    cancelled: AtomicBool,
+}
+
+impl ReceiveControl {
+    /// Called by the download task once its endpoint exists.
+    pub fn register(&self, endpoint: &Endpoint) {
+        if let Ok(mut slot) = self.endpoint.lock() {
+            *slot = Some(endpoint.clone());
+        }
+    }
+
+    /// Graceful stop: mark cancelled, then close the endpoint. The
+    /// running task's network calls fail promptly and it winds down on
+    /// its own — no task abort, so no torn-down state.
+    pub async fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+        let endpoint = self
+            .endpoint
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take());
+        if let Some(endpoint) = endpoint {
+            let _ = tokio::time::timeout(Duration::from_secs(5), endpoint.close()).await;
+        }
+    }
+
+    pub fn was_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+}
+
 #[derive(Default)]
 pub struct AppState {
     /// Sync mutex, deliberately never held across `.await`
@@ -41,9 +87,9 @@ pub struct AppState {
     /// Async mutex: held across the whole download on purpose, so a
     /// second Start click fails fast instead of corrupting the cache.
     receive_lock: tokio::sync::Mutex<()>,
-    /// Abort handle for the running download task, if any. Sync mutex,
-    /// short critical sections only — aborting is synchronous.
-    receive_cancel: Mutex<Option<tokio::task::AbortHandle>>,
+    /// Control block for the running download task, if any. Sync mutex,
+    /// short critical sections only.
+    receive_control: Mutex<Option<Arc<ReceiveControl>>>,
 }
 
 fn spawn_forwarder(
@@ -145,25 +191,31 @@ pub async fn receive_file(
         .join("blobs");
     let (events_tx, events_rx) = mpsc::unbounded_channel();
     spawn_forwarder(events_rx, on_event);
-    // The download runs as a task so `cancel_receive` can abort it. The
-    // lock stays in the command (not the task), so an abort can never
-    // leak it. Partial cache survives an abort and resumes next run.
-    let task = tokio::spawn(async move {
-        download::receive(&ticket, Path::new(&save_dir), &store_dir, events_tx).await
-    });
+    // The download runs as a task so `cancel_receive` can stop it. The
+    // lock stays in the command (not the task). Partial cache survives a
+    // cancel and resumes next run.
+    let control = Arc::new(ReceiveControl::default());
     *state
-        .receive_cancel
+        .receive_control
         .lock()
-        .map_err(|_| "internal state error".to_string())? = Some(task.abort_handle());
+        .map_err(|_| "internal state error".to_string())? = Some(control.clone());
+    let task = tokio::spawn({
+        let control = control.clone();
+        async move {
+            download::receive(&ticket, Path::new(&save_dir), &store_dir, events_tx, control).await
+        }
+    });
     let result = task.await;
     *state
-        .receive_cancel
+        .receive_control
         .lock()
         .map_err(|_| "internal state error".to_string())? = None;
     match result {
+        // Success wins even if a cancel landed during export: the file
+        // is there, so claiming cancellation would be false.
         Ok(Ok(name)) => Ok(name),
+        Ok(Err(_)) if control.was_cancelled() => Err("Download cancelled.".to_string()),
         Ok(Err(error)) => Err(format!("{error:#}")),
-        Err(join) if join.is_cancelled() => Err("Download cancelled.".to_string()),
         Err(join) => Err(format!("download task failed: {join}")),
     }
 }
@@ -171,14 +223,14 @@ pub async fn receive_file(
 #[tauri::command]
 pub async fn cancel_receive(app: AppHandle) -> Result<String, String> {
     let state = app.state::<AppState>();
-    let handle = state
-        .receive_cancel
+    let control = state
+        .receive_control
         .lock()
         .map_err(|_| "internal state error".to_string())?
         .take();
-    match handle {
-        Some(handle) => {
-            handle.abort();
+    match control {
+        Some(control) => {
+            control.cancel().await;
             Ok("Download cancelled.".to_string())
         }
         None => Ok("No download running.".to_string()),

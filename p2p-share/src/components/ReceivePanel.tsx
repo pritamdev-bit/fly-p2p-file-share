@@ -39,6 +39,9 @@ export default function ReceivePanel({ active }: { active: boolean }) {
   // Speed is the overall average since the first progress event — stable,
   // and honest across stalls and retries.
   const speedStart = useRef<{ at: number; done: number } | null>(null);
+  // Which stop button was pressed: pause keeps everything for Resume,
+  // cancel clears the form. Read when the stopped download settles.
+  const pendingAction = useRef<"pause" | "cancel" | null>(null);
 
   // Look up the real file name + size shortly after the ticket stops
   // changing. An empty ticket clears the preview without a backend call.
@@ -93,6 +96,7 @@ export default function ReceivePanel({ active }: { active: boolean }) {
     } else if (event.event === "Finished") {
       setStatus("finished");
       setResumable(false);
+      pendingAction.current = null;
     }
   }
 
@@ -113,6 +117,7 @@ export default function ReceivePanel({ active }: { active: boolean }) {
     setSavedName(null);
     setMessage("");
     setResumable(false);
+    pendingAction.current = null;
     setStatus("receiving");
     try {
       const name = await receiveFile(
@@ -123,23 +128,43 @@ export default function ReceivePanel({ active }: { active: boolean }) {
       setSavedName(name);
     } catch (err) {
       const text = err instanceof Error ? err.message : String(err);
-      if (text === "Download cancelled.") {
-        // User-initiated: back to idle with a neutral note, keeping the
-        // ticket + folder so Resume continues from the surviving cache.
+      if (text === "Download cancelled." && pendingAction.current === "cancel") {
+        // True cancel: clear the whole form.
+        pendingAction.current = null;
+        setTicket("");
+        setSaveDir(null);
+        setPreview(null);
+        setPreviewError("");
+        setProgress(null);
+        setSpeed(null);
+        speedStart.current = null;
+        setSavedName(null);
+        setResumable(false);
+        setStatus("idle");
+        setMessage("Download cancelled.");
+      } else if (text === "Download cancelled.") {
+        // Pause: back to idle with a neutral note, keeping the ticket +
+        // folder so Resume continues from the surviving cache.
+        pendingAction.current = null;
         setStatus("idle");
         setResumable(true);
-        setMessage("Download cancelled. Resume to continue.");
+        setMessage("Download paused. Resume to continue.");
       } else {
+        pendingAction.current = null;
         setStatus("error");
         setMessage(text);
       }
     }
   }
 
-  async function handleCancel() {
+  async function stopWith(action: "pause" | "cancel") {
+    // One backend command stops the in-flight attempt either way; pause
+    // vs cancel differ only in what the UI keeps afterwards.
+    pendingAction.current = action;
     try {
       await cancelReceive();
     } catch (err) {
+      pendingAction.current = null;
       setStatus("error");
       setMessage(err instanceof Error ? err.message : String(err));
     }
@@ -200,12 +225,20 @@ export default function ReceivePanel({ active }: { active: boolean }) {
           </span>
         </div>
         {status === "receiving" ? (
-          <button
-            className="btn-danger-outline btn-block btn-large"
-            onClick={handleCancel}
-          >
-            Cancel download
-          </button>
+          <div className="receive-actions">
+            <button
+              className="btn-ghost btn-large"
+              onClick={() => void stopWith("pause")}
+            >
+              Pause
+            </button>
+            <button
+              className="btn-danger-outline btn-large"
+              onClick={() => void stopWith("cancel")}
+            >
+              Cancel
+            </button>
+          </div>
         ) : (
           <button
             className="btn-primary btn-block btn-large"

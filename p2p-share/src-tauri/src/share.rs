@@ -82,8 +82,11 @@ pub struct ShareSession {
 impl ShareSession {
     /// Stop serving and remove the temporary store directory.
     pub async fn shutdown(self) {
-        if let Err(error) = self.router.shutdown().await {
-            eprintln!("fly: router shutdown error: {error:?}");
+        // Bounded: a stuck connection must never hang Stop sharing.
+        match tokio::time::timeout(Duration::from_secs(10), self.router.shutdown()).await {
+            Err(_) => eprintln!("fly: router shutdown timed out; continuing"),
+            Ok(Err(error)) => eprintln!("fly: router shutdown error: {error:?}"),
+            Ok(Ok(())) => {}
         }
         match tokio::fs::remove_dir_all(&self.temp_dir).await {
             Ok(()) => {}
