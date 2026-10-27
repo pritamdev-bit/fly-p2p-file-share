@@ -37,8 +37,13 @@ export default function ReceivePanel({ active }: { active: boolean }) {
   const [savedName, setSavedName] = useState<string | null>(null);
   const [resumable, setResumable] = useState(false);
   // Speed is the overall average since the first progress event — stable,
-  // and honest across stalls and retries.
+  // and honest across stalls and retries. Display updates are throttled
+  // so the number doesn't flicker with every progress event.
   const speedStart = useRef<{ at: number; done: number } | null>(null);
+  const lastSpeedUpdate = useRef(0);
+  // Set while a pause/cancel click is winding the backend down, so the
+  // buttons acknowledge immediately instead of flipping abruptly later.
+  const [stopping, setStopping] = useState<"pause" | "cancel" | null>(null);
   // Which stop button was pressed: pause keeps everything for Resume,
   // cancel clears the form. Read when the stopped download settles.
   const pendingAction = useRef<"pause" | "cancel" | null>(null);
@@ -86,10 +91,12 @@ export default function ReceivePanel({ active }: { active: boolean }) {
       const now = performance.now();
       if (!speedStart.current) {
         speedStart.current = { at: now, done };
+        lastSpeedUpdate.current = now;
         setSpeed(null);
       } else {
         const elapsed = (now - speedStart.current.at) / 1000;
-        if (elapsed > 0.5) {
+        if (elapsed > 0.5 && now - lastSpeedUpdate.current > 500) {
+          lastSpeedUpdate.current = now;
           setSpeed((done - speedStart.current.done) / elapsed);
         }
       }
@@ -97,6 +104,7 @@ export default function ReceivePanel({ active }: { active: boolean }) {
       setStatus("finished");
       setResumable(false);
       pendingAction.current = null;
+      setStopping(null);
     }
   }
 
@@ -114,6 +122,8 @@ export default function ReceivePanel({ active }: { active: boolean }) {
     setProgress(null);
     setSpeed(null);
     speedStart.current = null;
+    lastSpeedUpdate.current = 0;
+    setStopping(null);
     setSavedName(null);
     setMessage("");
     setResumable(false);
@@ -131,6 +141,7 @@ export default function ReceivePanel({ active }: { active: boolean }) {
       if (text === "Download cancelled." && pendingAction.current === "cancel") {
         // True cancel: clear the whole form.
         pendingAction.current = null;
+        setStopping(null);
         setTicket("");
         setSaveDir(null);
         setPreview(null);
@@ -146,11 +157,13 @@ export default function ReceivePanel({ active }: { active: boolean }) {
         // Pause: back to idle with a neutral note, keeping the ticket +
         // folder so Resume continues from the surviving cache.
         pendingAction.current = null;
+        setStopping(null);
         setStatus("idle");
         setResumable(true);
         setMessage("Download paused. Resume to continue.");
       } else {
         pendingAction.current = null;
+        setStopping(null);
         setStatus("error");
         setMessage(text);
       }
@@ -161,10 +174,12 @@ export default function ReceivePanel({ active }: { active: boolean }) {
     // One backend command stops the in-flight attempt either way; pause
     // vs cancel differ only in what the UI keeps afterwards.
     pendingAction.current = action;
+    setStopping(action);
     try {
       await cancelReceive();
     } catch (err) {
       pendingAction.current = null;
+      setStopping(null);
       setStatus("error");
       setMessage(err instanceof Error ? err.message : String(err));
     }
@@ -229,14 +244,16 @@ export default function ReceivePanel({ active }: { active: boolean }) {
             <button
               className="btn-ghost btn-large"
               onClick={() => void stopWith("pause")}
+              disabled={stopping !== null}
             >
-              Pause
+              {stopping === "pause" ? "Pausing…" : "Pause"}
             </button>
             <button
               className="btn-danger-outline btn-large"
               onClick={() => void stopWith("cancel")}
+              disabled={stopping !== null}
             >
-              Cancel
+              {stopping === "cancel" ? "Cancelling…" : "Cancel"}
             </button>
           </div>
         ) : (
