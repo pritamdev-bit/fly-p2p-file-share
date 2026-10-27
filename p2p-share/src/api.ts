@@ -93,20 +93,31 @@ export function normalizeTicket(ticket: string): string {
   return ticket.replace(/\s+/g, "");
 }
 
+/** Returned by `receive_file`: the saved name plus cache honesty. */
+export interface ReceiveInfo {
+  name: string;
+  fromCache: boolean;
+}
+
 export function receiveFile(
   ticket: string,
   saveDir: string,
   onMessage: (event: TransferEvent) => void,
-): Promise<string> {
+): Promise<ReceiveInfo> {
   requireTauri();
   const onEvent = new Channel<TransferEvent>();
   onEvent.onmessage = onMessage;
-  return invoke<string>("receive_file", { ticket, saveDir, onEvent });
+  return invoke<ReceiveInfo>("receive_file", { ticket, saveDir, onEvent });
 }
 
 export function stopSharing(): Promise<string> {
   requireTauri();
   return invoke<string>("stop_sharing");
+}
+
+export function pauseReceive(): Promise<string> {
+  requireTauri();
+  return invoke<string>("pause_receive");
 }
 
 export function cancelReceive(): Promise<string> {

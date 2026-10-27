@@ -5,6 +5,7 @@ import {
   formatBytes,
   formatSpeed,
   normalizeTicket,
+  pauseReceive,
   pickSaveDir,
   previewTicket,
   receiveFile,
@@ -35,6 +36,7 @@ export default function ReceivePanel({ active }: { active: boolean }) {
   const [status, setStatus] = useState<Status>("idle");
   const [message, setMessage] = useState("");
   const [savedName, setSavedName] = useState<string | null>(null);
+  const [fromCache, setFromCache] = useState(false);
   const [resumable, setResumable] = useState(false);
   // Speed is the overall average since the first progress event — stable,
   // and honest across stalls and retries. Display updates are throttled
@@ -44,15 +46,17 @@ export default function ReceivePanel({ active }: { active: boolean }) {
   // Set while a pause/cancel click is winding the backend down, so the
   // buttons acknowledge immediately instead of flipping abruptly later.
   const [stopping, setStopping] = useState<"pause" | "cancel" | null>(null);
-  // Which stop button was pressed: pause keeps everything for Resume,
-  // cancel clears the form. Read when the stopped download settles.
-  const pendingAction = useRef<"pause" | "cancel" | null>(null);
+  // Read by the preview effect so it stays quiet while receiving (the
+  // receive owns the ticket's cache dir during a download).
+  const statusRef = useRef(status);
+  statusRef.current = status;
 
   // Look up the real file name + size shortly after the ticket stops
   // changing. An empty ticket clears the preview without a backend call.
-  // Skipped while the tab is hidden; re-runs when it becomes visible.
+  // Skipped while the tab is hidden or a download runs (the receive owns
+  // the ticket's cache dir); re-runs when it becomes visible.
   useEffect(() => {
-    if (!active) return;
+    if (!active || statusRef.current === "receiving") return;
     const value = normalizeTicket(ticket);
     setPreview(null);
     setPreviewError("");
@@ -103,7 +107,6 @@ export default function ReceivePanel({ active }: { active: boolean }) {
     } else if (event.event === "Finished") {
       setStatus("finished");
       setResumable(false);
-      pendingAction.current = null;
       setStopping(null);
     }
   }
@@ -125,22 +128,23 @@ export default function ReceivePanel({ active }: { active: boolean }) {
     lastSpeedUpdate.current = 0;
     setStopping(null);
     setSavedName(null);
+    setFromCache(false);
     setMessage("");
     setResumable(false);
-    pendingAction.current = null;
     setStatus("receiving");
     try {
-      const name = await receiveFile(
+      const info = await receiveFile(
         normalizeTicket(ticket),
         saveDir ?? "",
         handleEvent,
       );
-      setSavedName(name);
+      setSavedName(info.name);
+      setFromCache(info.fromCache);
     } catch (err) {
       const text = err instanceof Error ? err.message : String(err);
-      if (text === "Download cancelled." && pendingAction.current === "cancel") {
-        // True cancel: clear the whole form.
-        pendingAction.current = null;
+      if (text === "Download cancelled.") {
+        // True cancel: clear the whole form. The backend also deleted
+        // this ticket's cache, so a re-receive starts from zero.
         setStopping(null);
         setTicket("");
         setSaveDir(null);
@@ -150,19 +154,18 @@ export default function ReceivePanel({ active }: { active: boolean }) {
         setSpeed(null);
         speedStart.current = null;
         setSavedName(null);
+        setFromCache(false);
         setResumable(false);
         setStatus("idle");
         setMessage("Download cancelled.");
-      } else if (text === "Download cancelled.") {
+      } else if (text === "Download paused.") {
         // Pause: back to idle with a neutral note, keeping the ticket +
         // folder so Resume continues from the surviving cache.
-        pendingAction.current = null;
         setStopping(null);
         setStatus("idle");
         setResumable(true);
         setMessage("Download paused. Resume to continue.");
       } else {
-        pendingAction.current = null;
         setStopping(null);
         setStatus("error");
         setMessage(text);
@@ -171,14 +174,15 @@ export default function ReceivePanel({ active }: { active: boolean }) {
   }
 
   async function stopWith(action: "pause" | "cancel") {
-    // One backend command stops the in-flight attempt either way; pause
-    // vs cancel differ only in what the UI keeps afterwards.
-    pendingAction.current = action;
+    // Pause keeps the ticket's cache for Resume; cancel deletes it.
     setStopping(action);
     try {
-      await cancelReceive();
+      if (action === "pause") {
+        await pauseReceive();
+      } else {
+        await cancelReceive();
+      }
     } catch (err) {
-      pendingAction.current = null;
       setStopping(null);
       setStatus("error");
       setMessage(err instanceof Error ? err.message : String(err));
@@ -211,6 +215,17 @@ export default function ReceivePanel({ active }: { active: boolean }) {
           onChange={(e) => {
             setTicket(e.currentTarget.value);
             setResumable(false);
+            // A new ticket means a new transfer: clear any leftover
+            // finished/cancelled state (never touch a live download).
+            if (status !== "receiving") {
+              setStatus("idle");
+              setMessage("");
+              setSavedName(null);
+              setFromCache(false);
+              setProgress(null);
+              setSpeed(null);
+              speedStart.current = null;
+            }
           }}
           placeholder="Paste ticket here…"
           spellCheck={false}
@@ -278,7 +293,8 @@ export default function ReceivePanel({ active }: { active: boolean }) {
         )}
         {status === "finished" && (
           <div className="banner banner-ok" role="status">
-            Saved{savedName ? ` as ${savedName}` : ""}.
+            Saved{savedName ? ` as ${savedName}` : ""}
+            {fromCache ? " — already downloaded, restored from cache." : "."}
           </div>
         )}
         {status === "idle" && message && (

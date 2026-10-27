@@ -13,10 +13,7 @@ use iroh::Endpoint;
 use serde::Serialize;
 use std::{
     path::Path,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, Mutex},
     time::Duration,
 };
 use tauri::{AppHandle, Manager, State, ipc::Channel};
@@ -41,14 +38,22 @@ impl Default for ShareSlot {
     }
 }
 
-/// Control block for the running download. Lets `cancel_receive` stop it
+/// How a running download was stopped: pause keeps the ticket's cache
+/// for Resume, cancel deletes it so a re-receive starts from zero.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CancelMode {
+    Pause,
+    Cancel,
+}
+
+/// Control block for the running download. Lets the UI stop it
 /// gracefully: closing the endpoint sends QUIC close frames, so the
 /// sender releases the receiver slot immediately instead of holding it
 /// until a connection timeout (which used to force 3-4 Resume clicks).
 #[derive(Default)]
 pub struct ReceiveControl {
     endpoint: Mutex<Option<Endpoint>>,
-    cancelled: AtomicBool,
+    cancelled: Mutex<Option<CancelMode>>,
 }
 
 impl ReceiveControl {
@@ -59,11 +64,13 @@ impl ReceiveControl {
         }
     }
 
-    /// Graceful stop: mark cancelled, then close the endpoint. The
+    /// Graceful stop: record the mode, then close the endpoint. The
     /// running task's network calls fail promptly and it winds down on
     /// its own — no task abort, so no torn-down state.
-    pub async fn cancel(&self) {
-        self.cancelled.store(true, Ordering::SeqCst);
+    pub async fn cancel(&self, mode: CancelMode) {
+        if let Ok(mut slot) = self.cancelled.lock() {
+            *slot = Some(mode);
+        }
         let endpoint = self
             .endpoint
             .lock()
@@ -74,9 +81,22 @@ impl ReceiveControl {
         }
     }
 
-    pub fn was_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::SeqCst)
+    pub fn cancel_mode(&self) -> Option<CancelMode> {
+        self.cancelled.lock().ok().and_then(|slot| *slot)
     }
+
+    pub fn was_cancelled(&self) -> bool {
+        self.cancel_mode().is_some()
+    }
+}
+
+/// What the UI needs once a download finishes.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReceiveInfo {
+    pub name: String,
+    /// True when every byte was already cached, so nothing transferred.
+    pub from_cache: bool,
 }
 
 #[derive(Default)]
@@ -178,7 +198,7 @@ pub async fn receive_file(
     ticket: String,
     save_dir: String,
     on_event: Channel<TransferEvent>,
-) -> Result<String, String> {
+) -> Result<ReceiveInfo, String> {
     let state = app.state::<AppState>();
     let _guard = state
         .receive_lock
@@ -211,17 +231,21 @@ pub async fn receive_file(
         .lock()
         .map_err(|_| "internal state error".to_string())? = None;
     match result {
-        // Success wins even if a cancel landed during export: the file
-        // is there, so claiming cancellation would be false.
-        Ok(Ok(name)) => Ok(name),
-        Ok(Err(_)) if control.was_cancelled() => Err("Download cancelled.".to_string()),
+        // Success wins even if a stop landed during export: the file
+        // is there, so claiming otherwise would be false.
+        Ok(Ok((name, from_cache))) => Ok(ReceiveInfo { name, from_cache }),
+        Ok(Err(_)) if control.cancel_mode() == Some(CancelMode::Pause) => {
+            Err("Download paused.".to_string())
+        }
+        Ok(Err(_)) if control.cancel_mode() == Some(CancelMode::Cancel) => {
+            Err("Download cancelled.".to_string())
+        }
         Ok(Err(error)) => Err(format!("{error:#}")),
         Err(join) => Err(format!("download task failed: {join}")),
     }
 }
 
-#[tauri::command]
-pub async fn cancel_receive(app: AppHandle) -> Result<String, String> {
+async fn stop_receive(app: &AppHandle, mode: CancelMode) -> Result<String, String> {
     let state = app.state::<AppState>();
     let control = state
         .receive_control
@@ -230,11 +254,24 @@ pub async fn cancel_receive(app: AppHandle) -> Result<String, String> {
         .take();
     match control {
         Some(control) => {
-            control.cancel().await;
-            Ok("Download cancelled.".to_string())
+            control.cancel(mode).await;
+            Ok(match mode {
+                CancelMode::Pause => "Download paused.".to_string(),
+                CancelMode::Cancel => "Download cancelled.".to_string(),
+            })
         }
         None => Ok("No download running.".to_string()),
     }
+}
+
+#[tauri::command]
+pub async fn pause_receive(app: AppHandle) -> Result<String, String> {
+    stop_receive(&app, CancelMode::Pause).await
+}
+
+#[tauri::command]
+pub async fn cancel_receive(app: AppHandle) -> Result<String, String> {
+    stop_receive(&app, CancelMode::Cancel).await
 }
 
 #[tauri::command]

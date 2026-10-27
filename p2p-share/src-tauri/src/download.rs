@@ -8,7 +8,7 @@ use crate::{
     events::TransferEvent,
     export::{export_file, validate_single_segment},
     share::{DONE_ALPN, METADATA_NAME, ShareMetadata, build_endpoint},
-    transfer::ReceiveControl,
+    transfer::{CancelMode, ReceiveControl},
 };
 use anyhow::{Context, Result, anyhow, bail};
 use iroh::{Endpoint, EndpointAddr, endpoint::Connection};
@@ -22,7 +22,12 @@ use iroh_blobs::{
 };
 use n0_future::StreamExt;
 use serde::Serialize;
-use std::{path::Path, str::FromStr, sync::Arc, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    str::FromStr,
+    sync::Arc,
+    time::Duration,
+};
 use tokio::{sync::mpsc, time::timeout};
 
 /// Timeouts: explicit everywhere so a stalled transfer always ends.
@@ -43,6 +48,7 @@ struct TicketTarget {
     store: Store,
     _protocol: BlobsProtocol,
     connection: Connection,
+    cache_dir: PathBuf,
     collection: Hash,
     file_name: String,
     file_hash: Hash,
@@ -60,21 +66,26 @@ pub struct FilePreview {
 /// Shared by preview (name + size only) and receive (full download).
 async fn connect_and_describe(
     ticket_text: &str,
-    store_dir: &Path,
+    base_dir: &Path,
     control: &ReceiveControl,
 ) -> Result<TicketTarget> {
     let ticket = BlobTicket::from_str(ticket_text.trim())
         .map_err(|_| anyhow!("That doesn't look like a fly ticket. Check for missing characters."))?;
-    std::fs::create_dir_all(store_dir).context("cannot open transfer cache")?;
+    // One cache dir per ticket (keyed by collection hash, so id and full
+    // tickets for the same file share it). Pause keeps the dir for
+    // resume; cancel deletes it. Orphaned dirs (crash, pause-forever)
+    // are pruned by the Phase 4 TTL pass.
+    let cache_dir = base_dir.join(format!("ticket-{}", ticket.hash().to_hex()));
+    std::fs::create_dir_all(&cache_dir).context("cannot open transfer cache")?;
     let endpoint = build_endpoint().await?;
     control.register(&endpoint);
-    // A cancel that landed before the endpoint was registered could not
+    // A stop that landed before the endpoint was registered could not
     // close anything; fail here instead, before contacting the sender.
     if control.was_cancelled() {
-        anyhow::bail!("Download cancelled.");
+        anyhow::bail!("Download stopped.");
     }
     let store = Store::from(
-        FsStore::load(store_dir)
+        FsStore::load(&cache_dir)
             .await
             .context("cannot open transfer cache")?,
     );
@@ -107,6 +118,7 @@ async fn connect_and_describe(
         store,
         _protocol,
         connection,
+        cache_dir,
         collection: ticket.hash(),
         file_name,
         file_hash,
@@ -115,10 +127,10 @@ async fn connect_and_describe(
 }
 
 /// Look up a ticket's file name + size without downloading the file.
-pub async fn preview(ticket_text: &str, store_dir: &Path) -> Result<FilePreview> {
+pub async fn preview(ticket_text: &str, base_dir: &Path) -> Result<FilePreview> {
     // Previews are short and not user-cancellable; the control is a dummy.
     let control = ReceiveControl::default();
-    let target = connect_and_describe(ticket_text, store_dir, &control).await?;
+    let target = connect_and_describe(ticket_text, base_dir, &control).await?;
     let preview = FilePreview {
         name: target.file_name.clone(),
         size: target.total,
@@ -127,17 +139,32 @@ pub async fn preview(ticket_text: &str, store_dir: &Path) -> Result<FilePreview>
     Ok(preview)
 }
 
-/// Download `ticket_text` into `save_dir`, using `store_dir` as the
-/// persistent blob cache. Returns the received file name.
+/// Download `ticket_text` into `save_dir`, caching blobs under `base_dir`
+/// (one subdir per ticket). Returns the received file name plus whether
+/// every byte was already cached, so the UI can say so honestly.
 pub async fn receive(
     ticket_text: &str,
     save_dir: &Path,
-    store_dir: &Path,
+    base_dir: &Path,
     events: mpsc::UnboundedSender<TransferEvent>,
     control: Arc<ReceiveControl>,
-) -> Result<String> {
-    let target = connect_and_describe(ticket_text, store_dir, &control).await?;
-    download_with_retry(&target, &events).await?;
+) -> Result<(String, bool)> {
+    let target = connect_and_describe(ticket_text, base_dir, &control).await?;
+    let from_cache = match download_with_retry(&target, &events).await {
+        Ok(from_cache) => from_cache,
+        Err(error) => {
+            if control.cancel_mode() == Some(CancelMode::Cancel) {
+                // True cancel (not pause): drop the store first to
+                // release file locks, then delete this ticket's whole
+                // cache dir so a re-receive starts from zero. Best
+                // effort — leftovers just resume as usual.
+                let cache_dir = target.cache_dir.clone();
+                drop(target);
+                std::fs::remove_dir_all(&cache_dir).ok();
+            }
+            return Err(error);
+        }
+    };
     export_file(&target.store, target.file_hash, &target.file_name, save_dir).await?;
     // Make the store durable before returning: a rapid re-receive opens
     // this same dir again, and must see the complete bitfield. Best
@@ -148,7 +175,7 @@ pub async fn receive(
     notify_sender(&target.endpoint, &target.sender, target.collection).await;
     let _ = events.send(TransferEvent::Finished);
     target.endpoint.close().await;
-    Ok(target.file_name)
+    Ok((target.file_name, from_cache))
 }
 
 /// Dial the sender's completion-ping protocol and send the collection
@@ -265,14 +292,16 @@ async fn describe_collection(
 
 /// Fetch the file blob with progress, retrying transient failures.
 /// Already-downloaded ranges are reused on retry automatically.
+/// Returns whether every byte was already cached (nothing transferred).
 async fn download_with_retry(
     target: &TicketTarget,
     events: &mpsc::UnboundedSender<TransferEvent>,
-) -> Result<()> {
+) -> Result<bool> {
     let remote = target.store.remote();
     let (hash, total) = (target.file_hash, target.total);
     let mut attempt = 0u32;
     let mut done = 0u64;
+    let mut from_cache = false;
     loop {
         attempt += 1;
         // Resume accounting: fetch progress counts only bytes downloaded
@@ -284,6 +313,9 @@ async fn download_with_retry(
             .map(|info| info.local_bytes())
             .unwrap_or(0)
             .min(total);
+        if attempt == 1 {
+            from_cache = base == total;
+        }
         done = done.max(base);
         let _ = events.send(TransferEvent::Progress { done, total });
         // Attempt 1 reuses the metadata connection. Later attempts dial
@@ -344,7 +376,7 @@ async fn download_with_retry(
         tokio::time::sleep(Duration::from_secs(2 * attempt as u64)).await;
     }
     let _ = events.send(TransferEvent::Progress { done: total, total });
-    Ok(())
+    Ok(from_cache)
 }
 
 #[cfg(test)]
@@ -359,6 +391,23 @@ mod tests {
     /// Within one test, share + receive still run concurrently — that is
     /// the product scenario; cross-test parallelism is not.
     static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Wait for a genuinely partial progress event (some but not all
+    /// bytes), so a test can stop a transfer mid-flight.
+    async fn wait_for_partial(rx: &mut mpsc::UnboundedReceiver<TransferEvent>) -> bool {
+        let begin = std::time::Instant::now();
+        while begin.elapsed() < Duration::from_secs(60) {
+            match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+                Ok(Some(TransferEvent::Progress { done, total })) => {
+                    if done > 0 && done < total {
+                        return true;
+                    }
+                }
+                _ => return false,
+            }
+        }
+        false
+    }
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn unique_test_dir(case: &str) -> PathBuf {
@@ -391,7 +440,7 @@ mod tests {
         .await
         .expect("share");
         let (recv_tx, _recv_rx) = mpsc::unbounded_channel();
-        let name = receive(
+        let (name, from_cache) = receive(
             &started.ticket,
             &out_dir,
             &cache_dir,
@@ -401,6 +450,7 @@ mod tests {
         .await
         .expect("receive");
         assert_eq!(name, "input.bin");
+        assert!(!from_cache, "fresh receive must transfer bytes");
         assert_eq!(
             std::fs::read(out_dir.join("input.bin")).unwrap(),
             content
@@ -510,7 +560,7 @@ mod tests {
         .expect("first receive");
 
         let (second_tx, mut second_rx) = mpsc::unbounded_channel();
-        let name = receive(
+        let (name, from_cache) = receive(
             &started.ticket,
             &out_second,
             &cache_dir,
@@ -520,6 +570,7 @@ mod tests {
         .await
         .expect("second receive");
         assert_eq!(name, "again.bin");
+        assert!(from_cache, "warm re-receive must report from-cache");
         assert_eq!(
             std::fs::read(out_second.join("again.bin")).unwrap(),
             content
@@ -549,7 +600,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_then_immediate_rereceive() {
         let _serial = SERIAL.lock().await;
-        let base = unique_test_dir("cancelresume");
+        let base = unique_test_dir("pauseresume");
         let src_dir = base.join("src");
         let out_first = base.join("out1");
         let out_second = base.join("out2");
@@ -577,31 +628,21 @@ mod tests {
         let task = tokio::spawn(async move {
             receive(&ticket_clone, &out_clone, &cache_clone, first_tx, task_control).await
         });
-        // Wait for a genuinely partial progress event, then abort.
-        let mut saw_partial = false;
-        let begin = std::time::Instant::now();
-        while begin.elapsed() < Duration::from_secs(60) {
-            match tokio::time::timeout(Duration::from_secs(5), first_rx.recv()).await {
-                Ok(Some(TransferEvent::Progress { done, total })) => {
-                    if done > 0 && done < total {
-                        saw_partial = true;
-                        break;
-                    }
-                }
-                _ => break,
-            }
-        }
-        assert!(saw_partial, "never saw a partial progress event");
-        // Graceful cancel, exactly like cancel_receive does.
-        control.cancel().await;
-        let cancelled = task.await.expect("task must wind down, not abort");
-        assert!(cancelled.is_err(), "cancelled receive must fail");
+        assert!(
+            wait_for_partial(&mut first_rx).await,
+            "never saw a partial progress event"
+        );
+        // Graceful pause, exactly like pause_receive does.
+        control.cancel(CancelMode::Pause).await;
+        let stopped = task.await.expect("task must wind down, not abort");
+        assert!(stopped.is_err(), "paused receive must fail");
         assert!(control.was_cancelled());
 
         // Immediate re-receive must work first try: the close frames the
-        // cancel sent already freed the sender's receiver slot.
+        // pause sent already freed the sender's receiver slot. The cache
+        // survives a pause, so this resumes instead of restarting.
         let (second_tx, _second_rx) = mpsc::unbounded_channel();
-        let name = receive(
+        let (name, _) = receive(
             &ticket,
             &out_second,
             &cache_dir,
@@ -612,6 +653,79 @@ mod tests {
         .expect("immediate re-receive must succeed");
         assert_eq!(name, "big.bin");
         assert_eq!(std::fs::read(out_second.join("big.bin")).unwrap().len(), 128 * 1024 * 1024);
+        started.session.shutdown().await;
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Cancel (not pause) deletes the ticket's cache dir, so a re-receive
+    /// starts from zero instead of resuming.
+    #[tokio::test]
+    async fn cancel_drops_partial_data() {
+        let _serial = SERIAL.lock().await;
+        let base = unique_test_dir("canceldrop");
+        let src_dir = base.join("src");
+        let out_first = base.join("out1");
+        let out_second = base.join("out2");
+        let cache_dir = base.join("cache");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let big: Vec<u8> = (0..(32u32 * 1024 * 1024)).map(|i| (i.wrapping_mul(11)) as u8).collect();
+        std::fs::write(src_dir.join("drop.bin"), &big).unwrap();
+        drop(big);
+
+        let (send_tx, _send_rx) = mpsc::unbounded_channel();
+        let started = share::start_share(&src_dir.join("drop.bin"), share::TicketType::Full, send_tx)
+            .await
+            .expect("share");
+        let ticket = started.ticket.clone();
+
+        let cache_clone = cache_dir.clone();
+        let out_clone = out_first.clone();
+        let ticket_clone = ticket.clone();
+        let (first_tx, mut first_rx) = mpsc::unbounded_channel();
+        let control = Arc::new(ReceiveControl::default());
+        let task_control = control.clone();
+        let task = tokio::spawn(async move {
+            receive(&ticket_clone, &out_clone, &cache_clone, first_tx, task_control).await
+        });
+        assert!(
+            wait_for_partial(&mut first_rx).await,
+            "never saw a partial progress event"
+        );
+        control.cancel(CancelMode::Cancel).await;
+        let stopped = task.await.expect("task must wind down, not abort");
+        assert!(stopped.is_err(), "cancelled receive must fail");
+        // This ticket was the only cache user: its dir must be gone.
+        let remaining: Vec<_> = std::fs::read_dir(&cache_dir)
+            .map(|entries| entries.flatten().collect())
+            .unwrap_or_default();
+        assert!(
+            remaining.is_empty(),
+            "cancel must delete the ticket cache dir"
+        );
+
+        // Re-receive restarts from zero: some progress event is partial.
+        let (second_tx, mut second_rx) = mpsc::unbounded_channel();
+        let (name, from_cache) = receive(
+            &ticket,
+            &out_second,
+            &cache_dir,
+            second_tx,
+            Arc::new(ReceiveControl::default()),
+        )
+        .await
+        .expect("re-receive must succeed");
+        assert_eq!(name, "drop.bin");
+        assert!(!from_cache, "fresh re-receive must transfer bytes");
+        assert_eq!(std::fs::read(out_second.join("drop.bin")).unwrap().len(), 32 * 1024 * 1024);
+        let mut saw_partial = false;
+        while let Ok(event) = second_rx.try_recv() {
+            if let TransferEvent::Progress { done, total } = event {
+                if done < total {
+                    saw_partial = true;
+                }
+            }
+        }
+        assert!(saw_partial, "re-receive must start from zero");
         started.session.shutdown().await;
         std::fs::remove_dir_all(&base).ok();
     }

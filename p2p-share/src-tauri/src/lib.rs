@@ -36,6 +36,7 @@ pub fn run() {
             transfer::send_file,
             transfer::receive_file,
             transfer::preview_ticket,
+            transfer::pause_receive,
             transfer::cancel_receive,
             transfer::stop_sharing,
             diagnostics::get_diagnostics,
