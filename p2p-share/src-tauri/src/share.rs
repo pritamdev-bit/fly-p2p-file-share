@@ -4,10 +4,10 @@
 //! `iroh-blobs` 0.103.1 APIs. `sendmer` (AGPL-3.0-only) served only as a
 //! behavioral reference; no code was copied from it.
 
-use crate::events::TransferEvent;
+use crate::{events::TransferEvent, prune};
 use anyhow::{Context, Result, anyhow, bail};
 use iroh::{
-    Endpoint, RelayMode, SecretKey,
+    Endpoint, EndpointAddr, RelayMode, SecretKey, Watcher,
     endpoint::{Connection, PortmapperConfig, presets},
     protocol::{AcceptError, ProtocolHandler, Router},
 };
@@ -208,6 +208,9 @@ pub async fn start_share(
     events: mpsc::UnboundedSender<TransferEvent>,
 ) -> Result<StartedShare> {
     validate_share_path(path)?;
+    // Best-effort: drop orphaned sender workspaces older than the TTL
+    // (crashes/kills leave them behind; Stop sharing deletes its own).
+    prune::prune_old_dirs(&std::env::temp_dir(), "fly-send-", prune::CACHE_TTL);
     let endpoint = build_endpoint().await?;
     let temp_dir = unique_temp_dir("fly-send-")?;
     std::fs::create_dir_all(&temp_dir).context("cannot create sender workspace")?;
@@ -226,6 +229,9 @@ pub async fn start_share(
         events: events.clone(),
     });
     let protocol = BlobsProtocol::new(&store, None);
+    // The ticket watcher (spawned below for full tickets) needs its own
+    // sender: `events` itself moves into the done-ping handler.
+    let ticket_events = events.clone();
     let router = Router::builder(endpoint.clone())
         .accept(
             iroh_blobs::protocol::ALPN,
@@ -251,12 +257,11 @@ pub async fn start_share(
     {
         eprintln!("fly: endpoint online probe timed out after 10s; continuing");
     }
-    let mut addr = router.endpoint().addr();
-    if ticket_type == TicketType::Id {
-        addr.addrs = Default::default();
-    }
-    let ticket = BlobTicket::new(addr, tag.hash(), BlobFormat::HashSeq).to_string();
+    let ticket = mint_ticket(&router.endpoint().addr(), ticket_type, tag.hash());
     let fingerprint = router.endpoint().id().to_string();
+    if ticket_type == TicketType::Full {
+        spawn_ticket_watcher(router.endpoint(), &ticket, tag.hash(), &ticket_events);
+    }
     Ok(StartedShare {
         session: ShareSession {
             router,
@@ -267,6 +272,59 @@ pub async fn start_share(
         ticket,
         fingerprint,
     })
+}
+
+/// Build the ticket string for one address snapshot. Id tickets keep
+/// the endpoint ID only (discovery resolves the rest, so they never go
+/// stale); full tickets embed relay + direct addresses.
+fn mint_ticket(addr: &EndpointAddr, ticket_type: TicketType, hash: Hash) -> String {
+    let mut addr = addr.clone();
+    if ticket_type == TicketType::Id {
+        addr.addrs = Default::default();
+    }
+    BlobTicket::new(addr, hash, BlobFormat::HashSeq).to_string()
+}
+
+/// Watch the endpoint's addresses for the life of the share; whenever
+/// they change (network switch, relay move), mint a fresh full ticket
+/// and push it to the UI so the displayed ticket never goes stale.
+/// The task ends with the share: `closed().run_until` stops it when the
+/// endpoint closes, and the weak events sender stops it if the session
+/// is dropped any other way. It holds no endpoint clone and no strong
+/// event sender, so it can never keep the share alive by itself.
+fn spawn_ticket_watcher(
+    endpoint: &Endpoint,
+    minted_ticket: &str,
+    hash: Hash,
+    events: &mpsc::UnboundedSender<TransferEvent>,
+) {
+    let closed = endpoint.closed();
+    let addr_stream = endpoint.watch_addr().stream();
+    let weak_events = events.downgrade();
+    let mut current = minted_ticket.to_owned();
+    tokio::spawn(closed.run_until(async move {
+        tokio::pin!(addr_stream);
+        while let Some(addr) = addr_stream.next().await {
+            let ticket = mint_ticket(&addr, TicketType::Full, hash);
+            // The stream yields the current address first, and flapping
+            // networks re-yield known states: only genuine changes
+            // reach the UI (this also wins the race where the address
+            // changed between minting and watching).
+            if ticket == current {
+                continue;
+            }
+            current = ticket.clone();
+            let Some(events) = weak_events.upgrade() else {
+                break;
+            };
+            if events
+                .send(TransferEvent::TicketUpdated { ticket })
+                .is_err()
+            {
+                break;
+            }
+        }
+    }));
 }
 
 fn validate_share_path(path: &Path) -> Result<()> {
@@ -338,4 +396,39 @@ fn unique_temp_dir(prefix: &str) -> Result<PathBuf> {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     Ok(std::env::temp_dir().join(format!("{prefix}{}-{}", std::process::id(), nanos)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iroh::TransportAddr;
+    use std::collections::BTreeSet;
+
+    fn addr_with(id: &iroh::EndpointId, ip: &str) -> EndpointAddr {
+        EndpointAddr {
+            id: id.clone(),
+            addrs: BTreeSet::from([TransportAddr::Ip(ip.parse().unwrap())]),
+        }
+    }
+
+    /// Id tickets must be immune to address changes (nothing carried,
+    /// nothing to go stale); full tickets must reflect them (that is
+    /// what the watcher re-mints on).
+    #[test]
+    fn mint_ticket_strips_id_keeps_full() {
+        let id = SecretKey::generate().public();
+        let before = addr_with(&id, "127.0.0.1:1111");
+        let after = addr_with(&id, "10.0.0.5:2222");
+        let hash = Hash::from_bytes([7u8; 32]);
+        assert_eq!(
+            mint_ticket(&before, TicketType::Id, hash),
+            mint_ticket(&after, TicketType::Id, hash),
+            "id tickets must not depend on addresses"
+        );
+        assert_ne!(
+            mint_ticket(&before, TicketType::Full, hash),
+            mint_ticket(&after, TicketType::Full, hash),
+            "full tickets must change with addresses"
+        );
+    }
 }

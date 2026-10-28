@@ -16,6 +16,11 @@ pub enum TransferEvent {
     /// Arrives over a tiny second protocol after export, best-effort —
     /// absence of this event does not mean the transfer failed.
     Delivered,
+    /// Sender-side only: the endpoint's addresses changed (network
+    /// switch, relay move), so a fresh full ticket was minted. The UI
+    /// replaces the displayed ticket and tells the user to re-send it.
+    /// Only full tickets go stale; id tickets carry no addresses.
+    TicketUpdated { ticket: String },
     // Failures travel as command `Err` strings, not events. Phase 4 may add:
     // WaitingForReceiver, fingerprint + diagnostics payloads.
 }

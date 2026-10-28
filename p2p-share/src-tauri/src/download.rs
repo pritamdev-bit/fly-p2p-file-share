@@ -34,6 +34,9 @@ use tokio::{sync::mpsc, time::timeout};
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const METADATA_TIMEOUT: Duration = Duration::from_secs(60);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+/// Reachability probe after a stall: long enough for a relayed dial,
+/// short enough that a dead sender fails fast instead of burning retries.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 /// The completion ping is a courtesy: quick timeout, never fails the run.
 const DONE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -150,7 +153,7 @@ pub async fn receive(
     control: Arc<ReceiveControl>,
 ) -> Result<(String, bool)> {
     let target = connect_and_describe(ticket_text, base_dir, &control).await?;
-    let from_cache = match download_with_retry(&target, &events).await {
+    let from_cache = match download_with_retry(&target, &events, &control).await {
         Ok(from_cache) => from_cache,
         Err(error) => {
             if control.cancel_mode() == Some(CancelMode::Cancel) {
@@ -160,7 +163,9 @@ pub async fn receive(
                 // effort — leftovers just resume as usual.
                 let cache_dir = target.cache_dir.clone();
                 drop(target);
-                std::fs::remove_dir_all(&cache_dir).ok();
+                if let Err(error) = std::fs::remove_dir_all(&cache_dir) {
+                    eprintln!("fly: cancel cleanup of {} failed: {error}", cache_dir.display());
+                }
             }
             return Err(error);
         }
@@ -290,12 +295,35 @@ async fn describe_collection(
     Ok((metadata.name, entry_hash, metadata.size))
 }
 
+/// The stall message: a dead sender must read as one, not as a
+/// cryptic timeout. Progress is always intact (cache survives), so the
+/// message points at Resume.
+fn sender_offline() -> anyhow::Error {
+    anyhow!("The sender went offline. Your progress is saved; Resume when they're back to continue.")
+}
+
+/// Short reachability check: can we still dial the sender at all?
+/// Used to tell "sender is gone" (fail fast) from "transient stall"
+/// (retry as before). The probe connection is dropped on success; the
+/// endpoint close at the end of the transfer reaps it.
+async fn probe_sender(endpoint: &Endpoint, sender: &EndpointAddr) -> Result<()> {
+    timeout(
+        PROBE_TIMEOUT,
+        endpoint.connect(sender.clone(), iroh_blobs::protocol::ALPN),
+    )
+    .await
+    .map_err(|_| anyhow!("sender unreachable"))?
+    .map(|_| ())
+    .map_err(|_| anyhow!("sender unreachable"))
+}
+
 /// Fetch the file blob with progress, retrying transient failures.
 /// Already-downloaded ranges are reused on retry automatically.
 /// Returns whether every byte was already cached (nothing transferred).
 async fn download_with_retry(
     target: &TicketTarget,
     events: &mpsc::UnboundedSender<TransferEvent>,
+    control: &ReceiveControl,
 ) -> Result<bool> {
     let remote = target.store.remote();
     let (hash, total) = (target.file_hash, target.total);
@@ -332,7 +360,13 @@ async fn download_with_retry(
                         .connect(target.sender.clone(), iroh_blobs::protocol::ALPN),
                 )
                 .await
-                .map_err(|_| anyhow!("Couldn't reach the sender (reconnect timed out)."))?
+                .map_err(|_| {
+                    anyhow!(
+                        "Couldn't reach the sender (reconnect timed out). \
+                         They may have gone offline; your progress is saved, \
+                         so Resume to continue."
+                    )
+                })?
                 .context("Couldn't reach the sender")?,
             )
         };
@@ -344,7 +378,28 @@ async fn download_with_retry(
         loop {
             match timeout(IDLE_TIMEOUT, stream.next()).await {
                 Err(_) => {
-                    failed = Some(anyhow!("stalled: no data for 120s"));
+                    // Idle timeout: nothing arrived for 120s. A closed
+                    // connection means the sender is gone — say so at
+                    // once instead of burning retries against the dead.
+                    // Otherwise probe: an unreachable sender fails fast
+                    // with the same message, a reachable one retries.
+                    // No diagnosis while WE are stopping: a probe dial
+                    // during endpoint teardown only delays the wind-down
+                    // (and on a loaded machine can stall it past the
+                    // close cap, leaving store files locked).
+                    if !control.was_cancelled()
+                        && (connection.close_reason().is_some()
+                            || probe_sender(&target.endpoint, &target.sender).await.is_err())
+                    {
+                        return Err(sender_offline());
+                    }
+                    // Only surfaces after RETRY_LIMIT stalls against a
+                    // sender that is still dialable — a sick network,
+                    // not a dead sender.
+                    failed = Some(anyhow!(
+                        "The transfer stalled: no data arrived after several retries. \
+                         Your progress is saved; Resume to try again."
+                    ));
                     break;
                 }
                 Ok(None) => {
@@ -361,6 +416,17 @@ async fn download_with_retry(
                     break;
                 }
                 Ok(Some(GetProgressItem::Error(cause))) => {
+                    // A dead connection (sender stopped sharing, QUIC gave
+                    // up) plus a failed redial is the sender going away
+                    // mid-transfer — not a transient blip worth retrying.
+                    // Skipped while WE are stopping (see the stall
+                    // branch): the stop already decided the outcome.
+                    if !control.was_cancelled()
+                        && connection.close_reason().is_some()
+                        && probe_sender(&target.endpoint, &target.sender).await.is_err()
+                    {
+                        return Err(sender_offline());
+                    }
                     failed = Some(anyhow!("download failed: {cause}"));
                     break;
                 }
@@ -385,12 +451,10 @@ mod tests {
     use crate::share;
     use std::path::PathBuf;
 
-    /// The transfer tests serialize on this lock. Each spins up live
-    /// endpoints against shared public relays + loopback, and running
-    /// them in parallel flakes (stalled fetches, wedged shutdowns).
-    /// Within one test, share + receive still run concurrently — that is
-    /// the product scenario; cross-test parallelism is not.
-    static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    /// Within one test, share + receive still run concurrently — that
+    /// is the product scenario; cross-test parallelism is not (see
+    /// `crate::TEST_SERIAL`).
+    use crate::TEST_SERIAL as SERIAL;
 
     /// Wait for a genuinely partial progress event (some but not all
     /// bytes), so a test can stop a transfer mid-flight.
@@ -473,6 +537,54 @@ mod tests {
         }
         assert!(delivered, "sender never received the completion ping");
         started.session.shutdown().await;
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Sender death mid-transfer must read as "went offline", not a
+    /// cryptic timeout — and it must fail fast, not burn retries.
+    #[tokio::test]
+    async fn sender_shutdown_mid_transfer_reports_offline() {
+        let _serial = SERIAL.lock().await;
+        let base = unique_test_dir("offline");
+        let src_dir = base.join("src");
+        let cache_dir = base.join("cache");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(src_dir.join("input.bin"), vec![7u8; 65536]).unwrap();
+
+        let (send_tx, _send_rx) = mpsc::unbounded_channel();
+        let started = share::start_share(
+            &src_dir.join("input.bin"),
+            share::TicketType::Full,
+            send_tx,
+        )
+        .await
+        .expect("share");
+        let control = ReceiveControl::default();
+        let target = connect_and_describe(&started.ticket, &cache_dir, &control)
+            .await
+            .expect("describe");
+        // Live sender: the probe passes.
+        probe_sender(&target.endpoint, &target.sender)
+            .await
+            .expect("live sender must be reachable");
+        // Sender stops sharing before the file fetch starts.
+        started.session.shutdown().await;
+
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        let begin = std::time::Instant::now();
+        let error = download_with_retry(&target, &events_tx, &control)
+            .await
+            .expect_err("fetch against a dead sender must fail");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("offline"),
+            "must read as sender-offline, got: {message}"
+        );
+        assert!(
+            begin.elapsed() < Duration::from_secs(60),
+            "must fail fast instead of hanging on retries"
+        );
+        target.endpoint.close().await;
         std::fs::remove_dir_all(&base).ok();
     }
 

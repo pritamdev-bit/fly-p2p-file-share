@@ -26,6 +26,9 @@ export default function SendPanel({ active }: { active: boolean }) {
   const [status, setStatus] = useState<Status>("idle");
   const [message, setMessage] = useState("");
   const [copied, setCopied] = useState(false);
+  // Set when the backend re-mints the ticket after a network change;
+  // anything the user copied or sent before that is stale.
+  const [ticketNote, setTicketNote] = useState("");
   const [dragging, setDragging] = useState(false);
   // The drop listener registers once; refs keep its checks current.
   const statusRef = useRef(status);
@@ -36,18 +39,26 @@ export default function SendPanel({ active }: { active: boolean }) {
   activeRef.current = active;
 
   function handleEvent(event: TransferEvent) {
-    // The sender only ever hears Sending + Delivered: pulls are
-    // receiver-driven, so no sender-side progress exists.
+    // The sender only ever hears Sending + Delivered + TicketUpdated:
+    // pulls are receiver-driven, so no sender-side progress exists.
     if (event.event === "Sending") {
       setReceivers(event.data.receivers);
     } else if (event.event === "Delivered") {
       setStatus("delivered");
+    } else if (event.event === "TicketUpdated") {
+      // The network changed and the backend re-minted the ticket.
+      // Anything copied or sent before is stale — say so plainly.
+      setShare((prev) => (prev ? { ...prev, ticket: event.data.ticket } : prev));
+      setCopied(false);
+      setTicketNote("Network changed — ticket refreshed. Copy and send the new ticket.");
     }
   }
 
   async function startShare(path: string, kind: TicketType) {
     setReceivers(0);
     setMessage("");
+    setTicketNote("");
+    setCopied(false);
     setStatus("preparing");
     try {
       const info = await sendFile(path, kind, handleEvent);
@@ -62,10 +73,11 @@ export default function SendPanel({ active }: { active: boolean }) {
   async function sharePath(path: string) {
     // Drops land on the hidden panel too — ignore them unless visible.
     if (!activeRef.current) return;
+    // Delivered no longer blocks: the backend auto-stopped the share,
+    // so the slot is free and a new share can start immediately.
     if (
       statusRef.current === "sharing" ||
-      statusRef.current === "preparing" ||
-      statusRef.current === "delivered"
+      statusRef.current === "preparing"
     ) {
       return;
     }
@@ -125,8 +137,7 @@ export default function SendPanel({ active }: { active: boolean }) {
     }
   }
 
-  const busy =
-    status === "sharing" || status === "preparing" || status === "delivered";
+  const busy = status === "sharing" || status === "preparing";
 
   return (
     <div className="view">
@@ -207,6 +218,11 @@ export default function SendPanel({ active }: { active: boolean }) {
                 {copied ? "Copied" : "Copy"}
               </button>
             </div>
+            {ticketNote && (
+              <div className="banner banner-info" role="status">
+                {ticketNote}
+              </div>
+            )}
             <Fingerprint value={share.fingerprint} />
             <div className="banner banner-warn">
               <AlertIcon size={16} />
@@ -215,7 +231,7 @@ export default function SendPanel({ active }: { active: boolean }) {
             <button
               className="btn-danger-outline btn-block"
               onClick={handleStop}
-              disabled={status === "stopped"}
+              disabled={status === "stopped" || status === "delivered"}
             >
               Stop sharing
             </button>
@@ -235,7 +251,7 @@ export default function SendPanel({ active }: { active: boolean }) {
                   ? `${receivers} receiver connected — keep this app open.`
                   : "Send the ticket to begin the transfer.")}
               {status === "delivered" &&
-                "The receiver got the file. The ticket stays valid until you stop sharing."}
+                "The receiver got the file. Sharing stopped automatically — this ticket is no longer valid."}
               {status === "stopped" && message}
             </p>
             {status === "delivered" && (
@@ -243,7 +259,7 @@ export default function SendPanel({ active }: { active: boolean }) {
                 <span className="deliver-pop" aria-hidden="true">
                   <CheckIcon size={20} />
                 </span>
-                Delivered — you can stop sharing now.
+                Delivered — sharing stopped automatically.
               </div>
             )}
             <div className="note-row">

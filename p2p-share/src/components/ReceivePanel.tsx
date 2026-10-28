@@ -3,6 +3,7 @@ import {
   cancelReceive,
   fileNameOf,
   formatBytes,
+  formatEta,
   formatSpeed,
   normalizeTicket,
   pauseReceive,
@@ -191,6 +192,13 @@ export default function ReceivePanel({ active }: { active: boolean }) {
 
   const canStart =
     status !== "receiving" && normalizeTicket(ticket) !== "" && saveDir !== null;
+  // Time remaining from the same overall-average speed, so it updates at
+  // the same throttled 2 Hz and never flickers. Hidden until a speed
+  // exists, and once the bar is full (finished shows the Saved banner).
+  const eta =
+    speed !== null && speed > 0 && progress && progress.done < progress.total
+      ? formatEta((progress.total - progress.done) / speed)
+      : null;
 
   return (
     <div className="view">
@@ -287,7 +295,10 @@ export default function ReceivePanel({ active }: { active: boolean }) {
           <div className="receive-progress">
             <Progress done={progress.done} total={progress.total} />
             {speed !== null && (
-              <div className="speed-line">{formatSpeed(speed)}</div>
+              <div className="speed-line">
+                {formatSpeed(speed)}
+                {eta ? ` · ${eta}` : ""}
+              </div>
             )}
           </div>
         )}

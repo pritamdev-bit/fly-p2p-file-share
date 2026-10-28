@@ -7,6 +7,7 @@
 use crate::{
     download,
     events::TransferEvent,
+    prune,
     share::{self, ShareSession, TicketType},
 };
 use iroh::Endpoint;
@@ -125,6 +126,52 @@ fn spawn_forwarder(
     });
 }
 
+/// Take an active session out of the slot for shutdown, leaving
+/// Starting/Empty untouched. The caller shuts it down after the lock
+/// drops (shutdown awaits; the sync guard is not `Send`).
+fn take_active_session(slot: &mut ShareSlot) -> Option<ShareSession> {
+    match std::mem::replace(slot, ShareSlot::Empty) {
+        ShareSlot::Active(session) => Some(session),
+        other => {
+            *slot = other;
+            None
+        }
+    }
+}
+
+/// Auto-stop: the receiver confirmed delivery, so this share is done.
+/// Stops serving (invalidating the ticket) and frees the slot.
+async fn autostop_on_delivered(state: &AppState) {
+    let session = state
+        .share
+        .lock()
+        .ok()
+        .and_then(|mut slot| take_active_session(&mut slot));
+    if let Some(session) = session {
+        session.shutdown().await;
+    }
+}
+
+/// Sender-side forwarder: on Delivered it stops the session BEFORE
+/// telling the UI, so the moment the UI hears "delivered" the slot is
+/// free and re-sharing works.
+fn spawn_share_forwarder(
+    app: AppHandle,
+    mut events: mpsc::UnboundedReceiver<TransferEvent>,
+    channel: Channel<TransferEvent>,
+) {
+    tauri::async_runtime::spawn(async move {
+        while let Some(event) = events.recv().await {
+            if matches!(event, TransferEvent::Delivered) {
+                autostop_on_delivered(app.state::<AppState>().inner()).await;
+            }
+            if channel.send(event).is_err() {
+                break;
+            }
+        }
+    });
+}
+
 fn lock_share<'a>(state: &'a State<'a, AppState>) -> Result<std::sync::MutexGuard<'a, ShareSlot>, String> {
     state.share.lock().map_err(|_| "internal state error".to_string())
 }
@@ -151,7 +198,7 @@ pub async fn send_file(
         }
     }
     let (events_tx, events_rx) = mpsc::unbounded_channel();
-    spawn_forwarder(events_rx, on_event);
+    spawn_share_forwarder(app.clone(), events_rx, on_event);
     let started = share::start_share(Path::new(&path), ticket_type, events_tx).await;
     // Decide under the lock; act after it. The sync guard must never be
     // held across an `.await` (it is not `Send`).
@@ -209,6 +256,9 @@ pub async fn receive_file(
         .app_data_dir()
         .map_err(|error| format!("cannot locate app data: {error}"))?
         .join("blobs");
+    // Best-effort: drop orphaned ticket caches older than the TTL
+    // (crashes/kills leave them behind; cancel deletes its own).
+    prune::prune_old_dirs(&store_dir, "ticket-", prune::CACHE_TTL);
     let (events_tx, events_rx) = mpsc::unbounded_channel();
     spawn_forwarder(events_rx, on_event);
     // The download runs as a task so `cancel_receive` can stop it. The
@@ -281,6 +331,7 @@ pub async fn preview_ticket(app: AppHandle, ticket: String) -> Result<download::
         .app_data_dir()
         .map_err(|error| format!("cannot locate app data: {error}"))?
         .join("blobs");
+    prune::prune_old_dirs(&store_dir, "ticket-", prune::CACHE_TTL);
     download::preview(&ticket, &store_dir)
         .await
         .map_err(|error| format!("{error:#}"))
@@ -307,5 +358,101 @@ pub async fn stop_sharing(app: AppHandle) -> Result<String, String> {
         Ok("Sharing stopped.".to_string())
     } else {
         Ok("Not sharing.".to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    fn unique_test_dir(case: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("fly-test-{}-{}-{case}", std::process::id(), nanos))
+    }
+
+    #[test]
+    fn take_active_session_leaves_other_slots_alone() {
+        let mut slot = ShareSlot::Empty;
+        assert!(take_active_session(&mut slot).is_none());
+        assert!(matches!(slot, ShareSlot::Empty));
+
+        let mut slot = ShareSlot::Starting { cancelled: false };
+        assert!(take_active_session(&mut slot).is_none());
+        assert!(matches!(slot, ShareSlot::Starting { cancelled: false }));
+    }
+
+    /// Delivered auto-stops the share: the slot frees up for re-share
+    /// and the ticket stops working.
+    #[tokio::test]
+    async fn delivered_autostops_share_and_invalidates_ticket() {
+        let _serial = crate::TEST_SERIAL.lock().await;
+        let base = unique_test_dir("autostop");
+        let src_dir = base.join("src");
+        let out_dir = base.join("out");
+        let out2_dir = base.join("out2");
+        let cache_dir = base.join("cache");
+        let cache2_dir = base.join("cache2");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(src_dir.join("input.bin"), vec![9u8; 65536]).unwrap();
+
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let started = share::start_share(
+            &src_dir.join("input.bin"),
+            share::TicketType::Full,
+            events_tx,
+        )
+        .await
+        .expect("share");
+        let state = AppState::default();
+        *state.share.lock().unwrap() = ShareSlot::Active(started.session);
+
+        let (recv_tx, _recv_rx) = mpsc::unbounded_channel();
+        let (name, _) = download::receive(
+            &started.ticket,
+            &out_dir,
+            &cache_dir,
+            recv_tx,
+            Arc::new(ReceiveControl::default()),
+        )
+        .await
+        .expect("receive");
+        assert_eq!(name, "input.bin");
+        // Drain sender events until Delivered, as the forwarder would.
+        let mut delivered = false;
+        while let Ok(Some(event)) =
+            tokio::time::timeout(Duration::from_secs(15), events_rx.recv()).await
+        {
+            if matches!(event, TransferEvent::Delivered) {
+                delivered = true;
+                break;
+            }
+        }
+        assert!(delivered, "sender never heard the completion ping");
+
+        // The forwarder's Delivered branch: stop before telling the UI.
+        autostop_on_delivered(&state).await;
+        assert!(
+            matches!(*state.share.lock().unwrap(), ShareSlot::Empty),
+            "slot must be free for re-share after Delivered"
+        );
+        // The ticket is dead: a second receive fails instead of serving.
+        let (recv2_tx, _recv2_rx) = mpsc::unbounded_channel();
+        let retry = download::receive(
+            &started.ticket,
+            &out2_dir,
+            &cache2_dir,
+            recv2_tx,
+            Arc::new(ReceiveControl::default()),
+        )
+        .await;
+        assert!(retry.is_err(), "ticket must be invalid after auto-stop");
+        std::fs::remove_dir_all(&base).ok();
     }
 }

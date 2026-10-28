@@ -2,8 +2,16 @@ mod diagnostics;
 mod download;
 mod events;
 mod export;
+mod prune;
 mod share;
 mod transfer;
+
+/// Live-transfer tests serialize on this lock: each spins up endpoints
+/// against shared public relays + loopback, and running them in
+/// parallel flakes (stalled fetches, wedged shutdowns). One lock for
+/// every live-transfer test, whichever module it lives in.
+#[cfg(test)]
+pub(crate) static TEST_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {

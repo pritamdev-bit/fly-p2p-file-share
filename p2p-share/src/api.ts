@@ -12,7 +12,8 @@ export type TransferEvent =
   | { event: "Progress"; data: { done: number; total: number } }
   | { event: "Sending"; data: { receivers: number } }
   | { event: "Finished" }
-  | { event: "Delivered" };
+  | { event: "Delivered" }
+  | { event: "TicketUpdated"; data: { ticket: string } };
 
 /** Returned by `send_file`: what the UI needs once a share starts. */
 export interface ShareInfo {
@@ -128,6 +129,20 @@ export function cancelReceive(): Promise<string> {
 export function formatSpeed(bytesPerSecond: number): string {
   if (!Number.isFinite(bytesPerSecond) || bytesPerSecond < 0) return "—";
   return `${formatBytes(Math.round(bytesPerSecond))}/s`;
+}
+
+export function formatEta(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds < 0) return "—";
+  const total = Math.round(seconds);
+  if (total < 60) return `${total}s left`;
+  const minutes = Math.floor(total / 60);
+  if (minutes < 60) {
+    const rest = total % 60;
+    return rest === 0 ? `${minutes}m left` : `${minutes}m ${rest}s left`;
+  }
+  const hours = Math.floor(minutes / 60);
+  const restMin = minutes % 60;
+  return restMin === 0 ? `${hours}h left` : `${hours}h ${restMin}m left`;
 }
 
 export function fetchDiagnostics(): Promise<DiagnosticsInfo> {
