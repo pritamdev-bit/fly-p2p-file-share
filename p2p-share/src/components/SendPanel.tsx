@@ -1,5 +1,7 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import qrcode from "qrcode-generator";
 import {
+  buildReceiveLink,
   copyText,
   fileNameOf,
   onFileDrop,
@@ -30,6 +32,15 @@ export default function SendPanel({ active }: { active: boolean }) {
   // anything the user copied or sent before that is stale.
   const [ticketNote, setTicketNote] = useState("");
   const [dragging, setDragging] = useState(false);
+  // QR encodes the fly:// receive link (regenerates with the ticket).
+  const [showQr, setShowQr] = useState(false);
+  const qrSvg = useMemo(() => {
+    if (!share) return "";
+    const qr = qrcode(0, "M");
+    qr.addData(buildReceiveLink(share.ticket));
+    qr.make();
+    return qr.createSvgTag(6, 0);
+  }, [share]);
   // The drop listener registers once; refs keep its checks current.
   const statusRef = useRef(status);
   statusRef.current = status;
@@ -44,6 +55,12 @@ export default function SendPanel({ active }: { active: boolean }) {
     if (event.event === "Sending") {
       setReceivers(event.data.receivers);
     } else if (event.event === "Delivered") {
+      // Auto-clear: the backend already stopped the share, so the
+      // ticket is dead — drop it from the display (and the QR).
+      setShare(null);
+      setShowQr(false);
+      setCopied(false);
+      setTicketNote("");
       setStatus("delivered");
     } else if (event.event === "TicketUpdated") {
       // The network changed and the backend re-minted the ticket.
@@ -59,6 +76,7 @@ export default function SendPanel({ active }: { active: boolean }) {
     setMessage("");
     setTicketNote("");
     setCopied(false);
+    setShowQr(false);
     setStatus("preparing");
     try {
       const info = await sendFile(path, kind, handleEvent);
@@ -122,6 +140,11 @@ export default function SendPanel({ active }: { active: boolean }) {
       setMessage(err instanceof Error ? err.message : String(err));
       return;
     }
+    // Auto-clear: the ticket is dead — drop it from the display.
+    setShare(null);
+    setShowQr(false);
+    setCopied(false);
+    setTicketNote("");
     setStatus("stopped");
     setMessage("Sharing stopped.");
   }
@@ -204,38 +227,59 @@ export default function SendPanel({ active }: { active: boolean }) {
         </div>
       )}
 
-      {share && (
+      {(share || status === "delivered" || status === "stopped") && (
         <div className="share-grid">
-          <div className="card">
-            <h2 className="card-title">Share this ticket</h2>
-            <p className="card-sub">Only share it with the person receiving this file.</p>
-            <div className="ticket-row">
-              <code className="ticket-code" title={share.ticket}>
-                {truncateMiddle(share.ticket)}
-              </code>
-              <button className="btn-ghost" onClick={handleCopy}>
-                {copied ? <CheckIcon size={16} /> : <CopyIcon size={16} />}
-                {copied ? "Copied" : "Copy"}
+          {share && (
+            <div className="card">
+              <h2 className="card-title">Share this ticket</h2>
+              <p className="card-sub">Only share it with the person receiving this file.</p>
+              <div className="ticket-row">
+                <code className="ticket-code" title={share.ticket}>
+                  {truncateMiddle(share.ticket)}
+                </code>
+                <button className="btn-ghost" onClick={handleCopy}>
+                  {copied ? <CheckIcon size={16} /> : <CopyIcon size={16} />}
+                  {copied ? "Copied" : "Copy"}
+                </button>
+              </div>
+              <button
+                className="btn-ghost btn-small qr-toggle"
+                onClick={() => setShowQr((visible) => !visible)}
+                aria-expanded={showQr}
+              >
+                {showQr ? "Hide QR code" : "Show QR code"}
+              </button>
+              {showQr && qrSvg && (
+                <div className="qr-wrap">
+                  <div
+                    className="qr-code"
+                    role="img"
+                    aria-label="QR code for the receive link"
+                    dangerouslySetInnerHTML={{ __html: qrSvg }}
+                  />
+                  <div className="qr-hint">
+                    Scan with any QR reader to get the receive link.
+                  </div>
+                </div>
+              )}
+              {ticketNote && (
+                <div className="banner banner-info" role="status">
+                  {ticketNote}
+                </div>
+              )}
+              <Fingerprint value={share.fingerprint} />
+              <div className="banner banner-warn">
+                <AlertIcon size={16} />
+                Anyone with this ticket can download this file.
+              </div>
+              <button
+                className="btn-danger-outline btn-block"
+                onClick={handleStop}
+              >
+                Stop sharing
               </button>
             </div>
-            {ticketNote && (
-              <div className="banner banner-info" role="status">
-                {ticketNote}
-              </div>
-            )}
-            <Fingerprint value={share.fingerprint} />
-            <div className="banner banner-warn">
-              <AlertIcon size={16} />
-              Anyone with this ticket can download this file.
-            </div>
-            <button
-              className="btn-danger-outline btn-block"
-              onClick={handleStop}
-              disabled={status === "stopped" || status === "delivered"}
-            >
-              Stop sharing
-            </button>
-          </div>
+          )}
 
           <div className="card status-card">
             <h2 className="status-heading">
@@ -251,7 +295,7 @@ export default function SendPanel({ active }: { active: boolean }) {
                   ? `${receivers} receiver connected — keep this app open.`
                   : "Send the ticket to begin the transfer.")}
               {status === "delivered" &&
-                "The receiver got the file. Sharing stopped automatically — this ticket is no longer valid."}
+                "The receiver got the file. Share another whenever you're ready."}
               {status === "stopped" && message}
             </p>
             {status === "delivered" && (
@@ -271,9 +315,11 @@ export default function SendPanel({ active }: { active: boolean }) {
                 </div>
               </div>
             </div>
-            <div className="banner banner-info">
-              This app must stay open while the file is being downloaded.
-            </div>
+            {status === "sharing" && (
+              <div className="banner banner-info">
+                This app must stay open while the file is being downloaded.
+              </div>
+            )}
           </div>
         </div>
       )}

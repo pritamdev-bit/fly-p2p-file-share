@@ -30,8 +30,14 @@ anyhow = "1"
 n0-future = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+open = "5"
 tauri-plugin-dialog = "2"
 tauri-plugin-clipboard-manager = "2"
+tauri-plugin-deep-link = "2"
+# deep-link feature: a second launch (fly:// click while running) routes
+# its URL through the deep-link handler instead of opening a new window.
+tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
+url = "2"
 tokio = { version = "1", features = ["rt", "sync", "time", "fs"] }
 
 [target.'cfg(unix)'.dependencies]

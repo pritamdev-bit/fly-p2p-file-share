@@ -5,13 +5,19 @@ import {
   formatBytes,
   formatEta,
   formatSpeed,
+  inspectTicket,
+  isExecutableName,
   normalizeTicket,
+  openReceived,
   pauseReceive,
   pickSaveDir,
   previewTicket,
   receiveFile,
+  revealReceived,
 } from "../api";
-import type { FilePreview, TransferEvent } from "../api";
+import type { FilePreview, TicketInfo, TransferEvent } from "../api";
+import type { IncomingTicket } from "../App";
+import Fingerprint from "./Fingerprint";
 import Progress from "./Progress";
 import {
   AlertIcon,
@@ -24,12 +30,26 @@ import {
 
 type Status = "idle" | "receiving" | "finished" | "error";
 
-export default function ReceivePanel({ active }: { active: boolean }) {
+export default function ReceivePanel({
+  active,
+  incomingTicket,
+}: {
+  active: boolean;
+  incomingTicket: IncomingTicket | null;
+}) {
   const [ticket, setTicket] = useState("");
   const [saveDir, setSaveDir] = useState<string | null>(null);
   const [preview, setPreview] = useState<FilePreview | null>(null);
   const [previewError, setPreviewError] = useState("");
   const [lookingUp, setLookingUp] = useState(false);
+  // Offline ticket parse (never connects): whose ticket this is, shown
+  // in the Ticket details disclosure. Failures stay silent — the
+  // debounced preview reports bad tickets soon enough.
+  const [ticketInfo, setTicketInfo] = useState<TicketInfo | null>(null);
+  // Executable guard: opening a runnable file needs one explicit extra
+  // click. Launch failures show inline without leaving finished state.
+  const [confirmingOpen, setConfirmingOpen] = useState(false);
+  const [launchError, setLaunchError] = useState("");
   const [progress, setProgress] = useState<{ done: number; total: number } | null>(
     null,
   );
@@ -51,6 +71,32 @@ export default function ReceivePanel({ active }: { active: boolean }) {
   // receive owns the ticket's cache dir during a download).
   const statusRef = useRef(status);
   statusRef.current = status;
+
+  // A new ticket means a new transfer: clear any leftover
+  // finished/cancelled/error state (never touch a live download).
+  function resetForNewTicket() {
+    setStatus("idle");
+    setMessage("");
+    setSavedName(null);
+    setFromCache(false);
+    setProgress(null);
+    setSpeed(null);
+    setTicketInfo(null);
+    setConfirmingOpen(false);
+    setLaunchError("");
+    setResumable(false);
+    speedStart.current = null;
+  }
+
+  // Deeplinks land here: prefill the ticket (never into a live download).
+  useEffect(() => {
+    if (!incomingTicket) return;
+    if (statusRef.current === "receiving") return;
+    resetForNewTicket();
+    setTicket(incomingTicket.ticket);
+    // resetForNewTicket only calls setState + a ref write.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [incomingTicket]);
 
   // Look up the real file name + size shortly after the ticket stops
   // changing. An empty ticket clears the preview without a backend call.
@@ -89,6 +135,28 @@ export default function ReceivePanel({ active }: { active: boolean }) {
     };
   }, [ticket, active]);
 
+  // Inspect on every change: the parse is offline (microseconds), so no
+  // debounce needed, and it works even when the sender is unreachable.
+  useEffect(() => {
+    if (!active) return;
+    const value = normalizeTicket(ticket);
+    if (value === "") {
+      setTicketInfo(null);
+      return;
+    }
+    let cancelled = false;
+    inspectTicket(value)
+      .then((info) => {
+        if (!cancelled) setTicketInfo(info);
+      })
+      .catch(() => {
+        if (!cancelled) setTicketInfo(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [ticket, active]);
+
   function handleEvent(event: TransferEvent) {
     if (event.event === "Progress") {
       const { done, total } = event.data;
@@ -122,6 +190,30 @@ export default function ReceivePanel({ active }: { active: boolean }) {
     }
   }
 
+  async function runLaunch(action: () => Promise<string>) {
+    setLaunchError("");
+    try {
+      await action();
+    } catch (err) {
+      setLaunchError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  async function handleOpen() {
+    // Runnable files need an explicit second click; everything else (and
+    // the confirmation itself) opens straight away.
+    if (savedName && isExecutableName(savedName) && !confirmingOpen) {
+      setConfirmingOpen(true);
+      return;
+    }
+    setConfirmingOpen(false);
+    await runLaunch(openReceived);
+  }
+
+  async function handleReveal() {
+    await runLaunch(revealReceived);
+  }
+
   async function handleStart() {
     setProgress(null);
     setSpeed(null);
@@ -132,6 +224,8 @@ export default function ReceivePanel({ active }: { active: boolean }) {
     setFromCache(false);
     setMessage("");
     setResumable(false);
+    setConfirmingOpen(false);
+    setLaunchError("");
     setStatus("receiving");
     try {
       const info = await receiveFile(
@@ -151,12 +245,15 @@ export default function ReceivePanel({ active }: { active: boolean }) {
         setSaveDir(null);
         setPreview(null);
         setPreviewError("");
+        setTicketInfo(null);
         setProgress(null);
         setSpeed(null);
         speedStart.current = null;
         setSavedName(null);
         setFromCache(false);
         setResumable(false);
+        setConfirmingOpen(false);
+        setLaunchError("");
         setStatus("idle");
         setMessage("Download cancelled.");
       } else if (text === "Download paused.") {
@@ -222,23 +319,43 @@ export default function ReceivePanel({ active }: { active: boolean }) {
           value={ticket}
           onChange={(e) => {
             setTicket(e.currentTarget.value);
-            setResumable(false);
-            // A new ticket means a new transfer: clear any leftover
-            // finished/cancelled state (never touch a live download).
-            if (status !== "receiving") {
-              setStatus("idle");
-              setMessage("");
-              setSavedName(null);
-              setFromCache(false);
-              setProgress(null);
-              setSpeed(null);
-              speedStart.current = null;
-            }
+            if (status !== "receiving") resetForNewTicket();
           }}
           placeholder="Paste ticket here…"
           spellCheck={false}
           autoComplete="off"
         />
+        {ticketInfo && status !== "receiving" && (
+          <details className="inspector">
+            <summary className="inspector-summary">Ticket details</summary>
+            <Fingerprint value={ticketInfo.fingerprint} />
+            <div className="inspector-row">
+              <span className="inspector-label">Type</span>
+              <span>
+                {ticketInfo.kind === "id"
+                  ? "Short — addresses resolve over discovery."
+                  : "Full — carries its own addresses."}
+              </span>
+            </div>
+            {ticketInfo.relays.map((relay) => (
+              <div className="inspector-row" key={relay}>
+                <span className="inspector-label">Relay</span>
+                <code className="inspector-value">{relay}</code>
+              </div>
+            ))}
+            {ticketInfo.addrs.map((addr) => (
+              <div className="inspector-row" key={addr}>
+                <span className="inspector-label">Address</span>
+                <code className="inspector-value">{addr}</code>
+              </div>
+            ))}
+            <div className="inspector-note">
+              Compare the fingerprint with the sender's screen before downloading —
+              only trust it if the ticket came through a channel you trust.
+              Never paste tickets into decoder websites; inspect them here.
+            </div>
+          </details>
+        )}
         {normalizeTicket(ticket) !== "" && (
           <div className="preview-card">
             {preview ? (
@@ -303,10 +420,48 @@ export default function ReceivePanel({ active }: { active: boolean }) {
           </div>
         )}
         {status === "finished" && (
-          <div className="banner banner-ok" role="status">
-            Saved{savedName ? ` as ${savedName}` : ""}
-            {fromCache ? " — already downloaded, restored from cache." : "."}
-          </div>
+          <>
+            <div className="banner banner-ok" role="status">
+              Saved{savedName ? ` as ${savedName}` : ""}
+              {fromCache ? " — already downloaded, restored from cache." : "."}
+            </div>
+            <div className="launch-row">
+              <button className="btn-ghost" onClick={handleOpen}>
+                Open file
+              </button>
+              <button className="btn-ghost" onClick={handleReveal}>
+                Show in folder
+              </button>
+            </div>
+            {confirmingOpen && savedName && (
+              <div className="banner banner-warn" role="alertdialog" aria-label="Confirm opening executable file">
+                <AlertIcon size={16} />
+                <div>
+                  <div>
+                    {fileNameOf(savedName)} can run programs on this computer.
+                    Open it only if you trust the sender.
+                  </div>
+                  <div className="launch-confirm-actions">
+                    <button className="btn-primary btn-small" onClick={handleOpen}>
+                      Open anyway
+                    </button>
+                    <button
+                      className="btn-ghost btn-small"
+                      onClick={() => setConfirmingOpen(false)}
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
+            {launchError && (
+              <div className="banner banner-error" role="alert">
+                <AlertIcon size={16} />
+                {launchError}
+              </div>
+            )}
+          </>
         )}
         {status === "idle" && message && (
           <div className="banner banner-info" role="status">

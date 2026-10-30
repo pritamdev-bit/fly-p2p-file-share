@@ -7,6 +7,8 @@
 use crate::{
     download,
     events::TransferEvent,
+    inspect,
+    launch,
     prune,
     share::{self, ShareSession, TicketType},
 };
@@ -111,6 +113,10 @@ pub struct AppState {
     /// Control block for the running download task, if any. Sync mutex,
     /// short critical sections only.
     receive_control: Mutex<Option<Arc<ReceiveControl>>>,
+    /// Full path of the last successfully received file. The open/reveal
+    /// commands act on exactly this — the UI passes no path, so it can
+    /// never aim them at anything else.
+    last_received: Mutex<Option<std::path::PathBuf>>,
 }
 
 fn spawn_forwarder(
@@ -269,6 +275,8 @@ pub async fn receive_file(
         .receive_control
         .lock()
         .map_err(|_| "internal state error".to_string())? = Some(control.clone());
+    // The task moves save_dir in; keep a copy for the last-received record.
+    let received_dir = save_dir.clone();
     let task = tokio::spawn({
         let control = control.clone();
         async move {
@@ -283,7 +291,15 @@ pub async fn receive_file(
     match result {
         // Success wins even if a stop landed during export: the file
         // is there, so claiming otherwise would be false.
-        Ok(Ok((name, from_cache))) => Ok(ReceiveInfo { name, from_cache }),
+        Ok(Ok((name, from_cache))) => {
+            // Export never renames, so save dir + name is the final path.
+            *state
+                .last_received
+                .lock()
+                .map_err(|_| "internal state error".to_string())? =
+                Some(Path::new(&received_dir).join(&name));
+            Ok(ReceiveInfo { name, from_cache })
+        }
         Ok(Err(_)) if control.cancel_mode() == Some(CancelMode::Pause) => {
             Err("Download paused.".to_string())
         }
@@ -335,6 +351,40 @@ pub async fn preview_ticket(app: AppHandle, ticket: String) -> Result<download::
     download::preview(&ticket, &store_dir)
         .await
         .map_err(|error| format!("{error:#}"))
+}
+
+/// Offline ticket inspection: parse only, never connects. Lets the UI
+/// show whose ticket this is before the user downloads anything.
+#[tauri::command]
+pub fn inspect_ticket(ticket: String) -> Result<inspect::TicketInfo, String> {
+    inspect::inspect(&ticket).map_err(|error| format!("{error:#}"))
+}
+
+/// Open the last received file with its default application. Takes no
+/// path: only the backend-recorded receive path can be opened.
+#[tauri::command]
+pub fn open_received(app: AppHandle) -> Result<String, String> {
+    let state = app.state::<AppState>();
+    let slot = state
+        .last_received
+        .lock()
+        .map_err(|_| "internal state error".to_string())?;
+    let path = launch::resolve_recorded(&slot).map_err(|error| format!("{error:#}"))?;
+    launch::open_path(&path).map_err(|error| format!("{error:#}"))?;
+    Ok("Opened.".to_string())
+}
+
+/// Show the last received file in its folder. Takes no path (see above).
+#[tauri::command]
+pub fn reveal_received(app: AppHandle) -> Result<String, String> {
+    let state = app.state::<AppState>();
+    let slot = state
+        .last_received
+        .lock()
+        .map_err(|_| "internal state error".to_string())?;
+    let path = launch::resolve_recorded(&slot).map_err(|error| format!("{error:#}"))?;
+    launch::reveal_path(&path).map_err(|error| format!("{error:#}"))?;
+    Ok("Opened.".to_string())
 }
 
 #[tauri::command]

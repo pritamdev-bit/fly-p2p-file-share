@@ -30,6 +30,15 @@ export interface FilePreview {
   size: number;
 }
 
+/** Returned by `inspect_ticket`: offline parse, never connects. */
+export interface TicketInfo {
+  fingerprint: string;
+  hash: string;
+  kind: "id" | "full";
+  relays: string[];
+  addrs: string[];
+}
+
 /** Returned by `get_diagnostics`. Never contains tickets or paths. */
 export interface DiagnosticsInfo {
   nodeId: string;
@@ -87,6 +96,52 @@ export function sendFile(
 export function previewTicket(ticket: string): Promise<FilePreview> {
   requireTauri();
   return invoke<FilePreview>("preview_ticket", { ticket });
+}
+
+export function inspectTicket(ticket: string): Promise<TicketInfo> {
+  requireTauri();
+  return invoke<TicketInfo>("inspect_ticket", { ticket });
+}
+
+export function openReceived(): Promise<string> {
+  requireTauri();
+  return invoke<string>("open_received");
+}
+
+export function revealReceived(): Promise<string> {
+  requireTauri();
+  return invoke<string>("reveal_received");
+}
+
+/** Canonical deeplink for a ticket (what the sender's QR encodes). */
+export function buildReceiveLink(ticket: string): string {
+  return `fly://receive?ticket=${ticket}`;
+}
+
+/** Drain launch-time deeplink tickets (cold-start links). */
+export async function takePendingTickets(): Promise<string[]> {
+  if (!isTauri()) return [];
+  return invoke<string[]>("take_pending_tickets");
+}
+
+/** Listen for deeplink tickets arriving while the app runs. */
+export async function onFlyOpenUrl(
+  handler: (ticket: string) => void,
+): Promise<UnlistenFn> {
+  if (!isTauri()) return () => {};
+  return listen<string>("fly-open-url", (event) => handler(event.payload));
+}
+
+/** Extensions that can run code when opened (checked before Open file). */
+const EXECUTABLE_EXTENSIONS = new Set([
+  "exe", "msi", "bat", "cmd", "com", "scr", "ps1", "vbs", "reg", "jar",
+  "sh", "bash", "run", "appimage", "desktop",
+]);
+
+export function isExecutableName(name: string): boolean {
+  const dot = name.lastIndexOf(".");
+  if (dot < 0) return false;
+  return EXECUTABLE_EXTENSIONS.has(name.slice(dot + 1).toLowerCase());
 }
 
 /** Tickets are one base32 word; chat apps may wrap them across lines. */

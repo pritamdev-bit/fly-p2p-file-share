@@ -6,7 +6,7 @@
 
 use crate::{
     events::TransferEvent,
-    export::{export_file, validate_single_segment},
+    export::{export_file, sanitize_filename, validate_single_segment},
     share::{DONE_ALPN, METADATA_NAME, ShareMetadata, build_endpoint},
     transfer::{CancelMode, ReceiveControl},
 };
@@ -292,7 +292,10 @@ async fn describe_collection(
     if entry_name != metadata.name {
         bail!("share contents are inconsistent");
     }
-    Ok((metadata.name, entry_hash, metadata.size))
+    // Sanitize once here so preview, export, and the returned name all
+    // agree on what will actually be created (a Linux sender can share
+    // `CON` or `a:b`, which Windows cannot create as-is).
+    Ok((sanitize_filename(&metadata.name), entry_hash, metadata.size))
 }
 
 /// The stall message: a dead sender must read as one, not as a

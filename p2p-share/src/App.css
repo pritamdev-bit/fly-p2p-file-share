@@ -370,6 +370,34 @@ button:focus-visible {
   margin-bottom: 12px;
 }
 
+.qr-toggle {
+  margin-bottom: 12px;
+}
+
+.qr-wrap {
+  margin-bottom: 12px;
+  text-align: center;
+}
+
+.qr-code {
+  display: inline-block;
+  padding: 12px;
+  border-radius: 10px;
+  background: #fff;
+  line-height: 0;
+}
+
+.qr-code svg {
+  width: 168px;
+  height: 168px;
+}
+
+.qr-hint {
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--text-mute);
+}
+
 .ticket-code {
   flex: 1;
   min-width: 0;
@@ -556,6 +584,48 @@ button:focus-visible {
   color: #ffa1a1;
 }
 
+.inspector {
+  margin-top: 12px;
+  padding: 9px 13px;
+  border-radius: 10px;
+  border: 1px dashed rgba(255, 255, 255, 0.18);
+}
+
+.inspector-summary {
+  cursor: pointer;
+  font-size: 12.5px;
+  color: var(--text-mute);
+}
+
+.inspector-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 7px;
+  font-size: 12.5px;
+}
+
+.inspector-label {
+  flex-shrink: 0;
+  color: var(--text-mute);
+}
+
+.inspector-value {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-dim);
+  overflow-wrap: anywhere;
+  text-align: right;
+}
+
+.inspector-note {
+  margin-top: 9px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-mute);
+}
+
 .connecting-hint {
   margin-top: 12px;
   font-size: 12.5px;
@@ -581,6 +651,22 @@ button:focus-visible {
 
 .receive-actions > button {
   flex: 1;
+}
+
+.launch-row {
+  display: flex;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.launch-row > button {
+  flex: 1;
+}
+
+.launch-confirm-actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 10px;
 }
 
 .deliver-banner {

@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { APP_NAME } from "./api";
+import { useEffect, useState } from "react";
+import { APP_NAME, onFlyOpenUrl, takePendingTickets } from "./api";
 import Diagnostics from "./components/Diagnostics";
 import ReceivePanel from "./components/ReceivePanel";
 import SendPanel from "./components/SendPanel";
@@ -8,9 +8,41 @@ import "./App.css";
 
 type View = "send" | "receive";
 
+/** A ticket pushed by a fly:// deeplink. The nonce re-triggers the
+    ReceivePanel effect even when the same link arrives twice. */
+export interface IncomingTicket {
+  ticket: string;
+  nonce: number;
+}
+
 export default function App() {
   const [view, setView] = useState<View>("send");
   const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
+  const [incomingTicket, setIncomingTicket] = useState<IncomingTicket | null>(null);
+
+  // Deeplinks open straight into Receive with the ticket prefilled:
+  // launch-time links are drained once, runtime links arrive as events.
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    const deliver = (ticket: string) => {
+      if (cancelled) return;
+      setView("receive");
+      setIncomingTicket((prev) => ({ ticket, nonce: (prev?.nonce ?? 0) + 1 }));
+    };
+    takePendingTickets()
+      .then((tickets) => tickets.forEach(deliver))
+      .catch(() => {});
+    onFlyOpenUrl(deliver)
+      .then((fn) => {
+        unlisten = fn;
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
 
   return (
     <div className="app">
@@ -60,7 +92,7 @@ export default function App() {
           <SendPanel active={view === "send"} />
         </div>
         <div className={view === "receive" ? "" : "view-hidden"}>
-          <ReceivePanel active={view === "receive"} />
+          <ReceivePanel active={view === "receive"} incomingTicket={incomingTicket} />
         </div>
       </main>
       <Diagnostics

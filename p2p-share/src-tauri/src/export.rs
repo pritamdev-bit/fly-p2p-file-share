@@ -28,6 +28,50 @@ pub fn validate_single_segment(name: &str) -> Result<()> {
     }
 }
 
+/// Windows device names, case-insensitive, with or without an extension
+/// (`NUL.txt` is as reserved as `NUL`). Verified against Microsoft's
+/// "Naming Files, Paths, and Namespaces" (Win32 FileIO docs).
+fn is_reserved_stem(stem: &str) -> bool {
+    matches!(
+        stem.to_ascii_uppercase().as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "COM1" | "COM2" | "COM3" | "COM4" | "COM5"
+            | "COM6" | "COM7" | "COM8" | "COM9" | "LPT1" | "LPT2" | "LPT3" | "LPT4"
+            | "LPT5" | "LPT6" | "LPT7" | "LPT8" | "LPT9"
+    )
+}
+
+/// Make a validated remote name safe to create on every release
+/// platform (a Linux sender can legally share `a:b` or `CON`, which
+/// Windows cannot create). Runs AFTER [`validate_single_segment`]:
+/// traversal is rejected, never silently rewritten. Idempotent, so
+/// calling it at describe time and again at export time is safe.
+/// Rules (same MS doc): strip trailing dots/spaces, replace
+/// `<>:"/\|?*` + control chars with `_`, prefix reserved stems with
+/// `_`, fall back to `file` when nothing remains.
+pub fn sanitize_filename(name: &str) -> String {
+    let trimmed = name.trim_end_matches(['.', ' ']);
+    let mut out: String = trimmed
+        .chars()
+        .map(|c| {
+            if matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*')
+                || c.is_control()
+            {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let stem = out.split('.').next().unwrap_or("").to_owned();
+    if is_reserved_stem(&stem) {
+        out.insert(0, '_');
+    }
+    if out.is_empty() {
+        out.push_str("file");
+    }
+    out
+}
+
 fn target_conflict(target: &Path) -> anyhow::Error {
     anyhow!(
         "'{}' already exists. Rename or remove it and try again",
@@ -119,6 +163,10 @@ pub async fn export_file(
     output_dir: &Path,
 ) -> Result<PathBuf> {
     validate_single_segment(file_name)?;
+    // Defense in depth: the receive path pre-sanitizes at describe time
+    // (so preview shows the real name), and this is idempotent anyway.
+    let safe_name = sanitize_filename(file_name);
+    let file_name = safe_name.as_str();
     std::fs::create_dir_all(output_dir).context("cannot create save folder")?;
     if !output_dir.is_dir() {
         bail!("save path is not a folder");
@@ -250,6 +298,49 @@ mod tests {
         #[cfg(unix)]
         {
             assert!(validate_single_segment("/abs.txt").is_err());
+        }
+    }
+
+    #[test]
+    fn sanitize_keeps_ordinary_names() {
+        for name in [
+            "report.pdf",
+            ".bashrc",
+            "my file.txt",
+            "résumé.pdf",
+            "archive.tar.gz",
+            "console",
+            "COM10",
+            "my CON file.txt",
+        ] {
+            assert_eq!(sanitize_filename(name), name, "must pass through: {name}");
+        }
+    }
+
+    #[test]
+    fn sanitize_neutralizes_platform_illegal_names() {
+        // Reserved device stems (any case, with or without extension).
+        assert_eq!(sanitize_filename("CON"), "_CON");
+        assert_eq!(sanitize_filename("nul.txt"), "_nul.txt");
+        assert_eq!(sanitize_filename("COM1"), "_COM1");
+        assert_eq!(sanitize_filename("lpt9.dat"), "_lpt9.dat");
+        // Trailing dots/spaces (leading dots stay: ".bashrc" is legal).
+        assert_eq!(sanitize_filename("notes. "), "notes");
+        assert_eq!(sanitize_filename("notes..."), "notes");
+        // Reserved characters + controls become underscores.
+        assert_eq!(sanitize_filename("a:b"), "a_b");
+        assert_eq!(sanitize_filename("a?b*c"), "a_b_c");
+        assert_eq!(sanitize_filename("a<b>c"), "a_b_c");
+        assert_eq!(sanitize_filename("a|b"), "a_b");
+        assert_eq!(sanitize_filename("a\"b"), "a_b");
+        assert_eq!(sanitize_filename("a\x07b"), "a_b");
+        // Nothing usable left: fall back instead of failing.
+        assert_eq!(sanitize_filename("..."), "file");
+        assert_eq!(sanitize_filename("   "), "file");
+        // Idempotent: describe-time + export-time passes agree.
+        for name in ["CON", "a:b", "notes. ", "report.pdf", "..."] {
+            let once = sanitize_filename(name);
+            assert_eq!(sanitize_filename(&once), once, "not idempotent: {name}");
         }
     }
 }
