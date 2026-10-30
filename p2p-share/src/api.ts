@@ -129,9 +129,16 @@ export function revealReceived(): Promise<string> {
   return invoke<string>("reveal_received");
 }
 
-/** Canonical deeplink for a ticket (what the sender's QR encodes). */
-export function buildReceiveLink(ticket: string): string {
-  return `fly://receive?ticket=${ticket}`;
+/**
+ * Bridge page base for share links (the ticket rides in the URL fragment,
+ * so it never reaches the server). Single place to change when the domain
+ * moves off the temporary subdomain.
+ */
+export const SHARE_LINK_BASE = "https://fly.pritam.codes/r";
+
+/** Linkifiable share link for a ticket (what the sender's QR encodes). */
+export function buildShareLink(ticket: string): string {
+  return `${SHARE_LINK_BASE}#${ticket}`;
 }
 
 /** Drain launch-time deeplink tickets (cold-start links). */

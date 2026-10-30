@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import qrcode from "qrcode-generator";
 import {
-  buildReceiveLink,
+  buildShareLink,
   copyText,
   fileNameOf,
   onFileDrop,
@@ -39,12 +39,12 @@ export default function SendPanel({
   // anything the user copied or sent before that is stale.
   const [ticketNote, setTicketNote] = useState("");
   const [dragging, setDragging] = useState(false);
-  // QR encodes the fly:// receive link (regenerates with the ticket).
+  // QR encodes the share link (regenerates with the ticket).
   const [showQr, setShowQr] = useState(false);
   const qrSvg = useMemo(() => {
     if (!share) return "";
     const qr = qrcode(0, "M");
-    qr.addData(buildReceiveLink(share.ticket));
+    qr.addData(buildShareLink(share.ticket));
     qr.make();
     return qr.createSvgTag(6, 0);
   }, [share]);
@@ -178,7 +178,7 @@ export default function SendPanel({
   async function handleCopyLink() {
     if (!share) return;
     try {
-      await copyText(buildReceiveLink(share.ticket));
+      await copyText(buildShareLink(share.ticket));
       setLinkCopied(true);
       window.setTimeout(() => setLinkCopied(false), 1500);
     } catch (err) {
@@ -269,12 +269,12 @@ export default function SendPanel({
                 </button>
               </div>
               <div className="link-row">
-                <code className="ticket-code link-code" title={buildReceiveLink(share.ticket)}>
-                  {truncateMiddle(buildReceiveLink(share.ticket))}
+                <code className="ticket-code link-code" title={buildShareLink(share.ticket)}>
+                  {truncateMiddle(buildShareLink(share.ticket))}
                 </code>
                 <button className="btn-ghost btn-small" onClick={handleCopyLink}>
                   {linkCopied ? <CheckIcon size={16} /> : <CopyIcon size={16} />}
-                  {linkCopied ? "Copied" : "Copy link"}
+                  {linkCopied ? "Copied" : "Copy share link"}
                 </button>
               </div>
               <button
@@ -293,7 +293,7 @@ export default function SendPanel({
                     dangerouslySetInnerHTML={{ __html: qrSvg }}
                   />
                   <div className="qr-hint">
-                    Scan with any QR reader to get the receive link.
+                    Scan with any phone or QR reader to open the receive link.
                   </div>
                 </div>
               )}
