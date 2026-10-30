@@ -8,6 +8,7 @@ import {
   formatSpeed,
   inspectTicket,
   isExecutableName,
+  loadSaveDir,
   normalizeTicket,
   openReceived,
   pauseReceive,
@@ -16,6 +17,7 @@ import {
   previewTicket,
   receiveFile,
   revealReceived,
+  storeSaveDir,
 } from "../api";
 import type { FilePreview, TicketInfo, TransferEvent } from "../api";
 import type { IncomingTicket } from "../App";
@@ -107,12 +109,36 @@ export default function ReceivePanel({
     onBusyChange(status === "receiving");
   }, [status, onBusyChange]);
 
+  // Restore the last save folder (OS downloads on first run). Runs once;
+  // the panel never unmounts, so this can't clobber a live download.
+  useEffect(() => {
+    let cancelled = false;
+    loadSaveDir()
+      .then((dir) => {
+        if (!cancelled && dir) setSaveDir(dir);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // After a finish, bring the saved banner + open buttons into view
+  // (nearest: no jump when already visible).
+  const finishedRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (status === "finished") finishedRef.current?.scrollIntoView({ block: "nearest" });
+  }, [status]);
+
   // Look up the real file name + size shortly after the ticket stops
   // changing. An empty ticket clears the preview without a backend call.
-  // Skipped while the tab is hidden or a download runs (the receive owns
-  // the ticket's cache dir); re-runs when it becomes visible.
+  // Skipped while the tab is hidden, while a download runs (the receive
+  // owns the ticket's cache dir), and after a finished download (the
+  // sender has auto-stopped by then, so a refire would only produce a
+  // spurious "couldn't reach the sender" error); re-runs when visible.
   useEffect(() => {
-    if (!active || statusRef.current === "receiving") return;
+    const settled = statusRef.current === "receiving" || statusRef.current === "finished";
+    if (!active || settled) return;
     const value = normalizeTicket(ticket);
     setPreview(null);
     setPreviewError("");
@@ -125,12 +151,18 @@ export default function ReceivePanel({
     const timer = window.setTimeout(() => {
       previewTicket(value)
         .then((found) => {
-          if (cancelled) return;
+          // A result that lands after a download started or finished is
+          // stale by definition — never let it overwrite live UI.
+          const stale =
+            cancelled || (statusRef.current !== "idle" && statusRef.current !== "error");
+          if (stale) return;
           setPreview(found);
           setPreviewError("");
         })
         .catch((err: unknown) => {
-          if (cancelled) return;
+          const stale =
+            cancelled || (statusRef.current !== "idle" && statusRef.current !== "error");
+          if (stale) return;
           setPreview(null);
           setPreviewError(err instanceof Error ? err.message : String(err));
         })
@@ -192,7 +224,10 @@ export default function ReceivePanel({
   async function handleChooseDir() {
     try {
       const picked = await pickSaveDir();
-      if (picked) setSaveDir(picked);
+      if (picked) {
+        setSaveDir(picked);
+        storeSaveDir(picked);
+      }
     } catch (err) {
       setStatus("error");
       setMessage(err instanceof Error ? err.message : String(err));
@@ -451,7 +486,7 @@ export default function ReceivePanel({
           </div>
         )}
         {status === "finished" && (
-          <>
+          <div ref={finishedRef}>
             <div className="banner banner-ok" role="status">
               Saved{savedName ? ` as ${savedName}` : ""}
               {fromCache ? " — already downloaded, restored from cache." : "."}
@@ -492,7 +527,7 @@ export default function ReceivePanel({
                 {launchError}
               </div>
             )}
-          </>
+          </div>
         )}
         {status === "idle" && message && (
           <div className="banner banner-info" role="status">

@@ -96,17 +96,38 @@ pub fn decode_qr_file(path: &Path) -> Result<String> {
     Ok(content)
 }
 
-/// Turn decoded QR text into a ticket: either a `fly://` link or the raw
-/// ticket itself. Anything else is rejected with a plain message.
+/// Turn decoded QR text into a ticket: a `fly://` link, an `https://`
+/// bridge share link (ticket in the fragment, `?ticket=` fallback), or
+/// the raw ticket itself. Anything else is rejected with a plain
+/// message. Any bridge host is accepted — the ticket check is the real
+/// gate, and the domain is expected to move over time.
 pub fn ticket_from_qr_text(text: &str) -> Result<String> {
     let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
     if compact.is_empty() {
         bail!("That QR code is empty.");
     }
-    if let Ok(url) = url::Url::parse(&compact)
-        && let Some(ticket) = parse_receive_link(&url)
-    {
-        return Ok(ticket);
+    if let Ok(url) = url::Url::parse(&compact) {
+        if let Some(ticket) = parse_receive_link(&url) {
+            return Ok(ticket);
+        }
+        if matches!(url.scheme(), "http" | "https") {
+            let candidate = url
+                .fragment()
+                .filter(|fragment| !fragment.is_empty())
+                .map(str::to_owned)
+                .or_else(|| {
+                    url.query_pairs()
+                        .find(|(key, _)| key == "ticket")
+                        .map(|(_, value)| value.into_owned())
+                });
+            if let Some(ticket) = candidate {
+                let ticket: String =
+                    ticket.chars().filter(|c| !c.is_whitespace()).collect();
+                inspect::inspect(&ticket)?;
+                return Ok(ticket);
+            }
+        }
+        bail!("That QR code isn't a fly ticket or link.");
     }
     inspect::inspect(&compact)?;
     Ok(compact)
@@ -202,7 +223,17 @@ mod tests {
         };
         let raw = BlobTicket::new(addr, Hash::from_bytes([5u8; 32]), BlobFormat::HashSeq).to_string();
         assert_eq!(ticket_from_qr_text(&raw).unwrap(), raw);
+        // Bridge share links: fragment first, ?ticket= fallback, any host.
+        assert_eq!(
+            ticket_from_qr_text(&format!("https://fly.pritam.codes/r#{raw}")).unwrap(),
+            raw
+        );
+        assert_eq!(
+            ticket_from_qr_text(&format!("https://example.com/r?ticket={raw}")).unwrap(),
+            raw
+        );
         assert!(ticket_from_qr_text("https://example.com").is_err());
+        assert!(ticket_from_qr_text("https://example.com/r#not-a-ticket").is_err());
         assert!(ticket_from_qr_text("   ").is_err());
     }
 }

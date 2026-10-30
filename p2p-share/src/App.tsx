@@ -23,6 +23,7 @@ export default function App() {
   // What is busy right now (panels report in). The ref feeds the close
   // handler (no stale closures); the snapshot drives the confirm dialog.
   const busyRef = useRef({ send: false, receive: false });
+  const quittingRef = useRef(false);
   const [quitConfirm, setQuitConfirm] = useState<{
     send: boolean;
     receive: boolean;
@@ -54,10 +55,15 @@ export default function App() {
 
   // Catch window-close clicks while a transfer or share is live: stop
   // the close and ask instead of dropping the transfer silently.
+  // (The backend defers every close to this listener's destroy() call,
+  // so core:window:allow-destroy must stay in the capabilities.)
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     getCurrentWindow()
       .onCloseRequested((event) => {
+        // Confirmed quits must not be re-intercepted: destroy() raises
+        // close-requested again while the transfer is still winding down.
+        if (quittingRef.current) return;
         const busy = busyRef.current;
         if (busy.send || busy.receive) {
           event.preventDefault();
@@ -157,7 +163,10 @@ export default function App() {
             <div className="quit-actions">
               <button
                 className="btn-danger-outline"
-                onClick={() => void getCurrentWindow().destroy()}
+                onClick={() => {
+                  quittingRef.current = true;
+                  void getCurrentWindow().destroy();
+                }}
               >
                 Quit anyway
               </button>

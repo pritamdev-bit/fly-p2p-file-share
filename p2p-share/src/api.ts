@@ -1,6 +1,7 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { UnlistenFn } from "@tauri-apps/api/event";
+import { downloadDir } from "@tauri-apps/api/path";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { open } from "@tauri-apps/plugin-dialog";
 
@@ -80,6 +81,33 @@ export async function pickFile(): Promise<string | null> {
 export async function pickSaveDir(): Promise<string | null> {
   requireTauri();
   return firstPath(await open({ directory: true, title: "Choose a save folder" }));
+}
+
+const SAVE_DIR_KEY = "fly.saveDir";
+
+/** Last save folder, or the OS downloads folder on first run. Persists
+    across restarts (webview storage); null when neither resolves. */
+export async function loadSaveDir(): Promise<string | null> {
+  try {
+    const stored = window.localStorage.getItem(SAVE_DIR_KEY);
+    if (stored) return stored;
+  } catch {
+    // Storage unavailable (shouldn't happen in-app) — fall through.
+  }
+  if (!isTauri()) return null;
+  try {
+    return await downloadDir();
+  } catch {
+    return null;
+  }
+}
+
+export function storeSaveDir(dir: string): void {
+  try {
+    window.localStorage.setItem(SAVE_DIR_KEY, dir);
+  } catch {
+    // Best effort — the folder still works for this session.
+  }
 }
 
 export async function pickQrImage(): Promise<string | null> {
