@@ -374,6 +374,18 @@ button:focus-visible {
   margin-bottom: 12px;
 }
 
+.link-row {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  margin-bottom: 12px;
+}
+
+.link-code {
+  padding: 7px 12px;
+  font-size: 12px;
+}
+
 .qr-wrap {
   margin-bottom: 12px;
   text-align: center;
@@ -584,6 +596,10 @@ button:focus-visible {
   color: #ffa1a1;
 }
 
+.qr-upload {
+  margin-top: 10px;
+}
+
 .inspector {
   margin-top: 12px;
   padding: 9px 13px;
@@ -667,6 +683,16 @@ button:focus-visible {
   display: flex;
   gap: 10px;
   margin-top: 10px;
+}
+
+.quit-actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.quit-actions > button {
+  flex: 1;
 }
 
 .deliver-banner {

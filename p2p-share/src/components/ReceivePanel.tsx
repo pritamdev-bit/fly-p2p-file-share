@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import {
   cancelReceive,
+  decodeQrTicket,
   fileNameOf,
   formatBytes,
   formatEta,
@@ -10,6 +11,7 @@ import {
   normalizeTicket,
   openReceived,
   pauseReceive,
+  pickQrImage,
   pickSaveDir,
   previewTicket,
   receiveFile,
@@ -33,9 +35,11 @@ type Status = "idle" | "receiving" | "finished" | "error";
 export default function ReceivePanel({
   active,
   incomingTicket,
+  onBusyChange,
 }: {
   active: boolean;
   incomingTicket: IncomingTicket | null;
+  onBusyChange: (busy: boolean) => void;
 }) {
   const [ticket, setTicket] = useState("");
   const [saveDir, setSaveDir] = useState<string | null>(null);
@@ -97,6 +101,11 @@ export default function ReceivePanel({
     // resetForNewTicket only calls setState + a ref write.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [incomingTicket]);
+
+  // Report live downloads so the app can confirm before quitting.
+  useEffect(() => {
+    onBusyChange(status === "receiving");
+  }, [status, onBusyChange]);
 
   // Look up the real file name + size shortly after the ticket stops
   // changing. An empty ticket clears the preview without a backend call.
@@ -184,6 +193,21 @@ export default function ReceivePanel({
     try {
       const picked = await pickSaveDir();
       if (picked) setSaveDir(picked);
+    } catch (err) {
+      setStatus("error");
+      setMessage(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  // Desktop alternative to pointing a camera at the screen: pick a QR
+  // screenshot, decode it, and use the ticket it carries.
+  async function handleUploadQr() {
+    try {
+      const picked = await pickQrImage();
+      if (!picked) return;
+      const ticket = await decodeQrTicket(picked);
+      resetForNewTicket();
+      setTicket(ticket);
     } catch (err) {
       setStatus("error");
       setMessage(err instanceof Error ? err.message : String(err));
@@ -325,6 +349,13 @@ export default function ReceivePanel({
           spellCheck={false}
           autoComplete="off"
         />
+        <button
+          className="btn-ghost btn-small qr-upload"
+          onClick={handleUploadQr}
+          disabled={status === "receiving"}
+        >
+          Upload a QR code instead
+        </button>
         {ticketInfo && status !== "receiving" && (
           <details className="inspector">
             <summary className="inspector-summary">Ticket details</summary>

@@ -74,6 +74,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            deeplink::decode_qr_ticket,
             deeplink::take_pending_tickets,
             transfer::send_file,
             transfer::receive_file,

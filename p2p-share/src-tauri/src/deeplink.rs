@@ -7,7 +7,9 @@
 //! pending slot, which the UI drains on mount (events emitted before the
 //! webview loads would be lost).
 
-use std::sync::Mutex;
+use crate::inspect;
+use anyhow::{Result, anyhow, bail};
+use std::{path::Path, sync::Mutex};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 /// Custom scheme, without `://`.
@@ -74,6 +76,50 @@ pub fn take_pending_tickets(state: State<'_, PendingTickets>) -> Vec<String> {
     state.take()
 }
 
+/// Decode the first QR code in an image file (PNG/JPEG/GIF), returning
+/// its text. Powers "upload a QR screenshot" receives on desktops, where
+/// holding a camera up to the screen is impractical.
+pub fn decode_qr_file(path: &Path) -> Result<String> {
+    let image = image::ImageReader::open(path)
+        .and_then(|reader| reader.with_guessed_format())
+        .map_err(|_| anyhow!("Couldn't read that image (PNG, JPEG, or GIF)."))?
+        .decode()
+        .map_err(|_| anyhow!("Couldn't read that image (PNG, JPEG, or GIF)."))?;
+    let mut prepared = rqrr::PreparedImage::prepare(image.to_luma8());
+    let grids = prepared.detect_grids();
+    let Some(grid) = grids.first() else {
+        bail!("No QR code found in that image.");
+    };
+    let (_, content) = grid
+        .decode()
+        .map_err(|_| anyhow!("Couldn't read that QR code."))?;
+    Ok(content)
+}
+
+/// Turn decoded QR text into a ticket: either a `fly://` link or the raw
+/// ticket itself. Anything else is rejected with a plain message.
+pub fn ticket_from_qr_text(text: &str) -> Result<String> {
+    let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    if compact.is_empty() {
+        bail!("That QR code is empty.");
+    }
+    if let Ok(url) = url::Url::parse(&compact)
+        && let Some(ticket) = parse_receive_link(&url)
+    {
+        return Ok(ticket);
+    }
+    inspect::inspect(&compact)?;
+    Ok(compact)
+}
+
+/// Decode a user-picked QR image into a receive ticket. The path always
+/// comes from the file dialog, never from webview input.
+#[tauri::command]
+pub fn decode_qr_ticket(path: String) -> Result<String, String> {
+    let text = decode_qr_file(Path::new(&path)).map_err(|error| format!("{error:#}"))?;
+    ticket_from_qr_text(&text).map_err(|error| format!("{error:#}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -115,5 +161,48 @@ mod tests {
         slot.push("b".to_string());
         assert_eq!(slot.take(), vec!["a".to_string(), "b".to_string()]);
         assert!(slot.take().is_empty());
+    }
+
+    fn testdata(name: &str) -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata")
+            .join(name)
+    }
+
+    #[test]
+    fn qr_fixture_decodes_to_link() {
+        let text = decode_qr_file(&testdata("qr-fly-link.gif")).expect("fixture must decode");
+        assert_eq!(text, "fly://receive?ticket=blobtestqr123");
+    }
+
+    #[test]
+    fn image_without_qr_is_an_error() {
+        let icon =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("icons").join("32x32.png");
+        let error = format!("{:#}", decode_qr_file(&icon).unwrap_err());
+        assert!(error.contains("No QR code"), "got: {error}");
+        let missing = testdata("does-not-exist.png");
+        let error = format!("{:#}", decode_qr_file(&missing).unwrap_err());
+        assert!(error.contains("Couldn't read"), "got: {error}");
+    }
+
+    #[test]
+    fn qr_text_accepts_link_or_raw_ticket() {
+        use iroh::{EndpointAddr, SecretKey};
+        use iroh_blobs::{BlobFormat, Hash, ticket::BlobTicket};
+        use std::collections::BTreeSet;
+
+        assert_eq!(
+            ticket_from_qr_text("fly://receive?ticket=blobabc").unwrap(),
+            "blobabc"
+        );
+        let addr = EndpointAddr {
+            id: SecretKey::generate().public(),
+            addrs: BTreeSet::new(),
+        };
+        let raw = BlobTicket::new(addr, Hash::from_bytes([5u8; 32]), BlobFormat::HashSeq).to_string();
+        assert_eq!(ticket_from_qr_text(&raw).unwrap(), raw);
+        assert!(ticket_from_qr_text("https://example.com").is_err());
+        assert!(ticket_from_qr_text("   ").is_err());
     }
 }

@@ -82,6 +82,22 @@ export async function pickSaveDir(): Promise<string | null> {
   return firstPath(await open({ directory: true, title: "Choose a save folder" }));
 }
 
+export async function pickQrImage(): Promise<string | null> {
+  requireTauri();
+  return firstPath(
+    await open({
+      multiple: false,
+      title: "Choose a QR code image",
+      filters: [{ name: "Images", extensions: ["png", "jpg", "jpeg", "gif"] }],
+    }),
+  );
+}
+
+export function decodeQrTicket(path: string): Promise<string> {
+  requireTauri();
+  return invoke<string>("decode_qr_ticket", { path });
+}
+
 export function sendFile(
   path: string,
   ticketType: TicketType,

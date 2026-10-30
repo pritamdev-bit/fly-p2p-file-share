@@ -1,4 +1,5 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { APP_NAME, onFlyOpenUrl, takePendingTickets } from "./api";
 import Diagnostics from "./components/Diagnostics";
 import ReceivePanel from "./components/ReceivePanel";
@@ -19,6 +20,13 @@ export default function App() {
   const [view, setView] = useState<View>("send");
   const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
   const [incomingTicket, setIncomingTicket] = useState<IncomingTicket | null>(null);
+  // What is busy right now (panels report in). The ref feeds the close
+  // handler (no stale closures); the snapshot drives the confirm dialog.
+  const busyRef = useRef({ send: false, receive: false });
+  const [quitConfirm, setQuitConfirm] = useState<{
+    send: boolean;
+    receive: boolean;
+  } | null>(null);
 
   // Deeplinks open straight into Receive with the ticket prefilled:
   // launch-time links are drained once, runtime links arrive as events.
@@ -42,6 +50,25 @@ export default function App() {
       cancelled = true;
       unlisten?.();
     };
+  }, []);
+
+  // Catch window-close clicks while a transfer or share is live: stop
+  // the close and ask instead of dropping the transfer silently.
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    getCurrentWindow()
+      .onCloseRequested((event) => {
+        const busy = busyRef.current;
+        if (busy.send || busy.receive) {
+          event.preventDefault();
+          setQuitConfirm({ ...busy });
+        }
+      })
+      .then((fn) => {
+        unlisten = fn;
+      })
+      .catch(() => {});
+    return () => unlisten?.();
   }, []);
 
   return (
@@ -89,16 +116,58 @@ export default function App() {
             hidden with CSS; each panel gates tab-specific listeners on
             its `active` prop. */}
         <div className={view === "send" ? "" : "view-hidden"}>
-          <SendPanel active={view === "send"} />
+          <SendPanel
+            active={view === "send"}
+            onBusyChange={(busy) => {
+              busyRef.current.send = busy;
+            }}
+          />
         </div>
         <div className={view === "receive" ? "" : "view-hidden"}>
-          <ReceivePanel active={view === "receive"} incomingTicket={incomingTicket} />
+          <ReceivePanel
+            active={view === "receive"}
+            incomingTicket={incomingTicket}
+            onBusyChange={(busy) => {
+              busyRef.current.receive = busy;
+            }}
+          />
         </div>
       </main>
       <Diagnostics
         open={diagnosticsOpen}
         onClose={() => setDiagnosticsOpen(false)}
       />
+      {quitConfirm && (
+        <div className="modal-overlay" onClick={() => setQuitConfirm(null)}>
+          <div
+            className="card modal-card"
+            role="alertdialog"
+            aria-modal="true"
+            aria-label="Confirm quit"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h2 className="card-title">Quit fly?</h2>
+            <p className="card-sub">
+              {quitConfirm.receive && quitConfirm.send
+                ? "A file is downloading and a file is being shared. Quitting stops both."
+                : quitConfirm.receive
+                  ? "A file is still downloading. Quitting stops it (progress stays saved for Resume)."
+                  : "A file is still being shared. Quitting stops the share."}
+            </p>
+            <div className="quit-actions">
+              <button
+                className="btn-danger-outline"
+                onClick={() => void getCurrentWindow().destroy()}
+              >
+                Quit anyway
+              </button>
+              <button className="btn-ghost" onClick={() => setQuitConfirm(null)}>
+                Stay
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

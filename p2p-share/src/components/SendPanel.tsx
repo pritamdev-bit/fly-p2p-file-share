@@ -20,7 +20,13 @@ function truncateMiddle(value: string, head = 14, tail = 10): string {
   return `${value.slice(0, head)}…${value.slice(-tail)}`;
 }
 
-export default function SendPanel({ active }: { active: boolean }) {
+export default function SendPanel({
+  active,
+  onBusyChange,
+}: {
+  active: boolean;
+  onBusyChange: (busy: boolean) => void;
+}) {
   const [filePath, setFilePath] = useState<string | null>(null);
   const [ticketType, setTicketType] = useState<TicketType>("id");
   const [share, setShare] = useState<ShareInfo | null>(null);
@@ -28,6 +34,7 @@ export default function SendPanel({ active }: { active: boolean }) {
   const [status, setStatus] = useState<Status>("idle");
   const [message, setMessage] = useState("");
   const [copied, setCopied] = useState(false);
+  const [linkCopied, setLinkCopied] = useState(false);
   // Set when the backend re-mints the ticket after a network change;
   // anything the user copied or sent before that is stale.
   const [ticketNote, setTicketNote] = useState("");
@@ -49,6 +56,11 @@ export default function SendPanel({ active }: { active: boolean }) {
   const activeRef = useRef(active);
   activeRef.current = active;
 
+  // Report live shares so the app can confirm before quitting.
+  useEffect(() => {
+    onBusyChange(status === "sharing" || status === "preparing");
+  }, [status, onBusyChange]);
+
   function handleEvent(event: TransferEvent) {
     // The sender only ever hears Sending + Delivered + TicketUpdated:
     // pulls are receiver-driven, so no sender-side progress exists.
@@ -60,6 +72,7 @@ export default function SendPanel({ active }: { active: boolean }) {
       setShare(null);
       setShowQr(false);
       setCopied(false);
+      setLinkCopied(false);
       setTicketNote("");
       setStatus("delivered");
     } else if (event.event === "TicketUpdated") {
@@ -76,6 +89,7 @@ export default function SendPanel({ active }: { active: boolean }) {
     setMessage("");
     setTicketNote("");
     setCopied(false);
+    setLinkCopied(false);
     setShowQr(false);
     setStatus("preparing");
     try {
@@ -144,6 +158,7 @@ export default function SendPanel({ active }: { active: boolean }) {
     setShare(null);
     setShowQr(false);
     setCopied(false);
+    setLinkCopied(false);
     setTicketNote("");
     setStatus("stopped");
     setMessage("Sharing stopped.");
@@ -155,6 +170,17 @@ export default function SendPanel({ active }: { active: boolean }) {
       await copyText(share.ticket);
       setCopied(true);
       window.setTimeout(() => setCopied(false), 1500);
+    } catch (err) {
+      setMessage(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  async function handleCopyLink() {
+    if (!share) return;
+    try {
+      await copyText(buildReceiveLink(share.ticket));
+      setLinkCopied(true);
+      window.setTimeout(() => setLinkCopied(false), 1500);
     } catch (err) {
       setMessage(err instanceof Error ? err.message : String(err));
     }
@@ -240,6 +266,15 @@ export default function SendPanel({ active }: { active: boolean }) {
                 <button className="btn-ghost" onClick={handleCopy}>
                   {copied ? <CheckIcon size={16} /> : <CopyIcon size={16} />}
                   {copied ? "Copied" : "Copy"}
+                </button>
+              </div>
+              <div className="link-row">
+                <code className="ticket-code link-code" title={buildReceiveLink(share.ticket)}>
+                  {truncateMiddle(buildReceiveLink(share.ticket))}
+                </code>
+                <button className="btn-ghost btn-small" onClick={handleCopyLink}>
+                  {linkCopied ? <CheckIcon size={16} /> : <CopyIcon size={16} />}
+                  {linkCopied ? "Copied" : "Copy link"}
                 </button>
               </div>
               <button

@@ -31,8 +31,13 @@ pub fn open_path(path: &Path) -> Result<()> {
 pub fn reveal_path(path: &Path) -> Result<()> {
     #[cfg(target_os = "windows")]
     {
+        // Flag and path MUST be separate argv entries: as one arg
+        // (`/select,<path>`) the whole thing gets quoted whenever the
+        // path contains spaces, Explorer's switch parser then misses
+        // the flag and opens Documents instead. Verified empirically.
         std::process::Command::new("explorer")
-            .arg(format!("/select,{}", path.display()))
+            .arg("/select,")
+            .arg(path)
             .spawn()
             .map_err(|error| anyhow!("Couldn't open the folder ({error})."))?;
     }
