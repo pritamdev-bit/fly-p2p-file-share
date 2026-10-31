@@ -481,6 +481,11 @@ export default function ReceivePanel({
         {progress && (status === "receiving" || status === "finished") && (
           <div className="receive-progress">
             <Progress done={progress.done} total={progress.total} />
+            {status === "receiving" && (
+              <div className="connecting-hint">
+                Keep this device awake — if it sleeps, Resume continues where it left off.
+              </div>
+            )}
             {speed !== null && (
               <div className="speed-line">
                 {formatSpeed(speed)}

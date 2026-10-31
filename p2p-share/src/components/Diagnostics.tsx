@@ -71,6 +71,19 @@ export default function Diagnostics({ open, onClose }: Props) {
             </div>
           </div>
         )}
+        {info && info.natType === "UDP blocked" && (
+          <div className="banner banner-warn" role="note">
+            UDP is blocked on this network: transfers still work through the
+            relay, but may be slower than direct connections.
+          </div>
+        )}
+        {info && !info.relayReachable && (
+          <div className="banner banner-warn" role="note">
+            No relay is reachable: check VPN, proxy, or firewall settings. If
+            your system showed a network-access prompt for fly, allow it —
+            without relay access, transfers outside your local network fail.
+          </div>
+        )}
         {error && (
           <div className="banner banner-error" role="alert">
             <AlertIcon size={16} />

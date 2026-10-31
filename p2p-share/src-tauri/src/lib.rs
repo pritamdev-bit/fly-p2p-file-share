@@ -1,5 +1,6 @@
 mod deeplink;
 mod diagnostics;
+mod disk;
 mod download;
 mod events;
 mod export;

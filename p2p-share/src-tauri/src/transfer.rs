@@ -292,7 +292,8 @@ pub async fn receive_file(
         // Success wins even if a stop landed during export: the file
         // is there, so claiming otherwise would be false.
         Ok(Ok((name, from_cache))) => {
-            // Export never renames, so save dir + name is the final path.
+            // The name is what export actually created (`file (1).zip`
+            // when the folder already had one), so joining is exact.
             *state
                 .last_received
                 .lock()

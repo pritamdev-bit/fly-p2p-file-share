@@ -327,7 +327,7 @@ export default function SendPanel({
             <p className="card-sub">
               {status === "sharing" &&
                 (receivers > 0
-                  ? `${receivers} receiver connected — keep this app open.`
+                  ? `${receivers} receiver connected — keep this app open and the device awake.`
                   : "Send the ticket to begin the transfer.")}
               {status === "delivered" &&
                 "The receiver got the file. Share another whenever you're ready."}

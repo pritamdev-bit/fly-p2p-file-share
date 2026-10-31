@@ -72,21 +72,18 @@ pub fn sanitize_filename(name: &str) -> String {
     out
 }
 
-fn target_conflict(target: &Path) -> anyhow::Error {
-    anyhow!(
-        "'{}' already exists. Rename or remove it and try again",
-        target.display()
-    )
-}
-
-/// Fail if anything (file, dir, or dangling symlink) already exists at
-/// `target`. Uses `symlink_metadata` so a symlink at the target can never
-/// redirect the commit.
-fn ensure_absent(target: &Path) -> Result<()> {
-    match std::fs::symlink_metadata(target) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error).context("cannot inspect save destination"),
-        Ok(_) => Err(target_conflict(target)),
+/// `file (N).zip`-style candidate for attempt N (0 = the plain name).
+/// The extension splits at the last dot; extensionless, dot-leading,
+/// and dot-trailing names take the suffix at the end.
+fn suffixed_name(file_name: &str, attempt: u32) -> String {
+    if attempt == 0 {
+        return file_name.to_string();
+    }
+    match file_name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() && !ext.is_empty() => {
+            format!("{stem} ({attempt}).{ext}")
+        }
+        _ => format!("{file_name} ({attempt})"),
     }
 }
 
@@ -155,7 +152,8 @@ async fn export_to_staging(db: &Store, hash: Hash, staged_target: &Path) -> Resu
 }
 
 /// Export one blob through staging + a validated atomic commit.
-/// Returns the final path. Never merges, renames, skips, or overwrites.
+/// Returns the final path. A taken name gains a ` (N)` suffix; never
+/// merges or overwrites.
 pub async fn export_file(
     db: &Store,
     hash: Hash,
@@ -172,28 +170,40 @@ pub async fn export_file(
         bail!("save path is not a folder");
     }
     cleanup_stale_staging(output_dir);
-    let target = output_dir.join(file_name);
-    ensure_absent(&target)?;
     let staging = staging_dir(output_dir)?;
     let staged_target = staging.join(file_name);
     if let Err(error) = export_to_staging(db, hash, &staged_target).await {
         cleanup_staging(&staging);
         return Err(error);
     }
-    // Re-check: another process may have created the target meanwhile.
-    if let Err(error) = ensure_absent(&target) {
-        cleanup_staging(&staging);
-        return Err(error);
-    }
-    if let Err(error) = move_without_replacing(&staged_target, &target) {
-        cleanup_staging(&staging);
-        if error.kind() == std::io::ErrorKind::AlreadyExists {
-            return Err(target_conflict(&target));
+    // Commit with `file (N).zip` fallback: every candidate goes through
+    // the same atomic no-replace move, so the pick is never a racy
+    // check-then-act — the move itself is the check, and a target that
+    // appears between candidates just takes the next suffix.
+    for attempt in 0..100u32 {
+        let target = output_dir.join(suffixed_name(file_name, attempt));
+        // Fast path only: skip obviously-taken names (file, dir, or
+        // dangling symlink — `symlink_metadata` never follows it) so a
+        // symlink at the target can never redirect the commit.
+        if attempt > 0 && std::fs::symlink_metadata(&target).is_ok() {
+            continue;
         }
-        return Err(error.into());
+        match move_without_replacing(&staged_target, &target) {
+            Ok(()) => {
+                cleanup_staging(&staging);
+                return Ok(target);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                cleanup_staging(&staging);
+                return Err(error.into());
+            }
+        }
     }
     cleanup_staging(&staging);
-    Ok(target)
+    Err(anyhow!(
+        "could not find a free name for '{file_name}' after 100 attempts"
+    ))
 }
 
 /// Atomically move the staged file into place without replacing an existing
@@ -342,5 +352,15 @@ mod tests {
             let once = sanitize_filename(name);
             assert_eq!(sanitize_filename(&once), once, "not idempotent: {name}");
         }
+    }
+
+    #[test]
+    fn suffixes_keep_the_extension_last() {
+        assert_eq!(suffixed_name("report.pdf", 0), "report.pdf");
+        assert_eq!(suffixed_name("report.pdf", 1), "report (1).pdf");
+        assert_eq!(suffixed_name("archive.tar.gz", 2), "archive.tar (2).gz");
+        assert_eq!(suffixed_name("README", 1), "README (1)");
+        assert_eq!(suffixed_name(".bashrc", 1), ".bashrc (1)");
+        assert_eq!(suffixed_name("notes.", 1), "notes. (1)");
     }
 }

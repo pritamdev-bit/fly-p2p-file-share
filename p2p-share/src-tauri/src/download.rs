@@ -5,6 +5,7 @@
 //! (the Tauri adapter forwards it into the IPC `Channel`).
 
 use crate::{
+    disk,
     events::TransferEvent,
     export::{export_file, sanitize_filename, validate_single_segment},
     share::{DONE_ALPN, METADATA_NAME, ShareMetadata, build_endpoint},
@@ -87,6 +88,15 @@ async fn connect_and_describe(
 ) -> Result<TicketTarget> {
     let ticket = BlobTicket::from_str(ticket_text.trim())
         .map_err(|_| anyhow!("That doesn't look like a fly ticket. Check for missing characters."))?;
+    // Short tickets carry no addresses and resolve the sender over
+    // discovery (DNS/Pkarr). When one fails to connect, say so: "full
+    // works, short fails" almost always means filtered DNS.
+    let id_kind = ticket.addr().addrs.is_empty();
+    let dns_hint = if id_kind {
+        " This is a short ticket, which finds the sender over discovery (DNS/Pkarr) — if a full ticket from the same sender works but this fails, your network may be filtering DNS."
+    } else {
+        ""
+    };
     // One cache dir per ticket (keyed by collection hash, so id and full
     // tickets for the same file share it). Pause keeps the dir for
     // resume; cancel deletes it. Orphaned dirs (crash, pause-forever)
@@ -116,9 +126,11 @@ async fn connect_and_describe(
     )
     .await
     .map_err(|_| {
-        anyhow!("Couldn't reach the sender (connection timed out). Are they still sharing?")
+        anyhow!(
+            "Couldn't reach the sender (connection timed out). Are they still sharing?{dns_hint}"
+        )
     })?
-    .context("Couldn't reach the sender")?;
+    .context(format!("Couldn't reach the sender.{dns_hint}"))?;
     let remote = store.remote();
     let collection = timeout(
         METADATA_TIMEOUT,
@@ -173,6 +185,28 @@ pub async fn receive(
     // opening it twice concurrently hangs (see `STORE_ACCESS`).
     let _guard = STORE_ACCESS.write().await;
     let target = connect_and_describe(ticket_text, base_dir, &control).await?;
+    // Disk preflight: refuse before downloading anything when the save
+    // folder or the ticket cache cannot hold the transfer.
+    let cached = target
+        .store
+        .remote()
+        .local((target.file_hash, BlobFormat::Raw))
+        .await
+        .map(|info| info.local_bytes())
+        .unwrap_or(0);
+    let (need_save, need_cache) = disk::space_needs(target.total, cached);
+    disk::ensure_space(
+        disk::available_space(save_dir)?,
+        need_save,
+        save_dir,
+        "in the save folder",
+    )?;
+    disk::ensure_space(
+        disk::available_space(&target.cache_dir)?,
+        need_cache,
+        &target.cache_dir,
+        "in the download cache",
+    )?;
     let from_cache = match download_with_retry(&target, &events, &control).await {
         Ok(from_cache) => from_cache,
         Err(error) => {
@@ -195,7 +229,15 @@ pub async fn receive(
             return Err(error);
         }
     };
-    export_file(&target.store, target.file_hash, &target.file_name, save_dir).await?;
+    // The export may suffix the name (`file (1).zip`) when the save
+    // folder already has one — the UI and the open/reveal record must
+    // use what was actually created, not the ticket name.
+    let final_path =
+        export_file(&target.store, target.file_hash, &target.file_name, save_dir).await?;
+    let received_name = final_path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| target.file_name.clone());
     // Make the store durable before returning: a rapid re-receive opens
     // this same dir again, and must see the complete bitfield. Best
     // effort — if it fails, the next fetch just re-downloads some ranges.
@@ -205,7 +247,7 @@ pub async fn receive(
     notify_sender(&target.endpoint, &target.sender, target.collection).await;
     let _ = events.send(TransferEvent::Finished);
     close_endpoint(&target.endpoint).await;
-    Ok((target.file_name, from_cache))
+    Ok((received_name, from_cache))
 }
 
 /// Dial the sender's completion-ping protocol and send the collection
@@ -1119,6 +1161,92 @@ mod tests {
             "sender still shows the vanished receiver after 90s"
         );
         started.session.shutdown().await;
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Receiving twice into the same folder must not fail: the second
+    /// export takes a ` (1)` suffix, and the returned name is what was
+    /// actually created (the open/reveal record joins it).
+    #[tokio::test]
+    async fn second_receive_into_same_folder_suffixes() {
+        let _serial = SERIAL.lock().await;
+        let base = unique_test_dir("dupsuffix");
+        let src_dir = base.join("src");
+        let out_dir = base.join("out");
+        let cache_dir = base.join("cache");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let content: Vec<u8> = (0..65536u32).map(|i| (i.wrapping_mul(7)) as u8).collect();
+        std::fs::write(src_dir.join("input.bin"), &content).unwrap();
+
+        let (send_tx, _send_rx) = mpsc::unbounded_channel();
+        let started = share::start_share(
+            &src_dir.join("input.bin"),
+            share::TicketType::Full,
+            send_tx,
+        )
+        .await
+        .expect("share");
+        let (first_tx, _first_rx) = mpsc::unbounded_channel();
+        let (first, _) = receive(
+            &started.ticket,
+            &out_dir,
+            &cache_dir,
+            first_tx,
+            Arc::new(ReceiveControl::default()),
+        )
+        .await
+        .expect("first receive");
+        assert_eq!(first, "input.bin");
+        let (second_tx, _second_rx) = mpsc::unbounded_channel();
+        let (second, from_cache) = receive(
+            &started.ticket,
+            &out_dir,
+            &cache_dir,
+            second_tx,
+            Arc::new(ReceiveControl::default()),
+        )
+        .await
+        .expect("second receive must suffix, not fail");
+        assert_eq!(second, "input (1).bin");
+        assert!(from_cache, "second receive must come from cache");
+        assert_eq!(std::fs::read(out_dir.join("input.bin")).unwrap(), content);
+        assert_eq!(
+            std::fs::read(out_dir.join("input (1).bin")).unwrap(),
+            content
+        );
+        started.session.shutdown().await;
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// A short ticket that cannot connect must point at DNS filtering,
+    /// not just report the unreachable sender.
+    #[tokio::test]
+    async fn short_ticket_connect_failure_names_dns() {
+        let _serial = SERIAL.lock().await;
+        let base = unique_test_dir("dnshint");
+        let src_dir = base.join("src");
+        let cache_dir = base.join("cache");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(src_dir.join("input.bin"), vec![7u8; 1024]).unwrap();
+
+        let (send_tx, _send_rx) = mpsc::unbounded_channel();
+        let started = share::start_share(&src_dir.join("input.bin"), share::TicketType::Id, send_tx)
+            .await
+            .expect("share");
+        let ticket = started.ticket.clone();
+        // Sender gone before the receiver dials.
+        started.session.shutdown().await;
+
+        let control = ReceiveControl::default();
+        let error = match connect_and_describe(&ticket, &cache_dir, &control).await {
+            Ok(_) => panic!("dialing a dead sender must fail"),
+            Err(error) => error,
+        };
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("DNS"),
+            "short-ticket failure must name DNS, got: {message}"
+        );
         std::fs::remove_dir_all(&base).ok();
     }
 
