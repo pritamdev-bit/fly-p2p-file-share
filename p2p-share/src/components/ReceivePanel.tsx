@@ -346,8 +346,11 @@ export default function ReceivePanel({
     }
   }
 
+  // Start stays disabled while the ticket lookup runs: starting
+  // mid-lookup used to wedge the transfer (the backend now also
+  // serializes the two, so this is just the friendly face of it).
   const canStart =
-    status !== "receiving" && normalizeTicket(ticket) !== "" && saveDir !== null;
+    status !== "receiving" && normalizeTicket(ticket) !== "" && saveDir !== null && !lookingUp;
   // Time remaining from the same overall-average speed, so it updates at
   // the same throttled 2 Hz and never flickers. Hidden until a speed
   // exists, and once the bar is full (finished shows the Saved banner).
@@ -467,6 +470,7 @@ export default function ReceivePanel({
             className="btn-primary btn-block btn-large"
             onClick={handleStart}
             disabled={!canStart}
+            title={lookingUp ? "Waiting for the ticket lookup…" : undefined}
           >
             {resumable ? "Resume download" : "Start receiving"}
           </button>

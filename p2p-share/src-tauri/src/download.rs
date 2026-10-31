@@ -28,7 +28,10 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tokio::{sync::mpsc, time::timeout};
+use tokio::{
+    sync::{RwLock, mpsc},
+    time::timeout,
+};
 
 /// Timeouts: explicit everywhere so a stalled transfer always ends.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -43,6 +46,16 @@ const DONE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Same-process retry reuses already-downloaded ranges automatically.
 /// Attempts after the first reconnect, so a network switch can recover.
 const RETRY_LIMIT: u32 = 3;
+
+/// Serializes ticket-store access across lookups and downloads. A
+/// download holds the write guard for its whole run; a lookup holds a
+/// read guard for its few seconds. This exists because opening the
+/// same ticket store twice concurrently hangs forever (observed on
+/// Windows: the second `FsStore::load` never returns, even after the
+/// first store is dropped) — and a task stuck there keeps the receive
+/// lock held, wedging the app until restart. Lookups never wait for a
+/// download (`try_read` + busy error); downloads wait for lookups.
+static STORE_ACCESS: RwLock<()> = RwLock::const_new(());
 
 /// What a ticket points at, with the connection ready to pull from.
 struct TicketTarget {
@@ -59,7 +72,7 @@ struct TicketTarget {
 }
 
 /// What the receiver UI shows before downloading anything.
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub struct FilePreview {
     pub name: String,
     pub size: u64,
@@ -130,7 +143,11 @@ async fn connect_and_describe(
 }
 
 /// Look up a ticket's file name + size without downloading the file.
+/// Refuses while a download runs (busy) instead of blocking on it.
 pub async fn preview(ticket_text: &str, base_dir: &Path) -> Result<FilePreview> {
+    let _guard = STORE_ACCESS
+        .try_read()
+        .map_err(|_| anyhow!("Lookup is busy — a download is using the transfer cache."))?;
     // Previews are short and not user-cancellable; the control is a dummy.
     let control = ReceiveControl::default();
     let target = connect_and_describe(ticket_text, base_dir, &control).await?;
@@ -138,7 +155,7 @@ pub async fn preview(ticket_text: &str, base_dir: &Path) -> Result<FilePreview> 
         name: target.file_name.clone(),
         size: target.total,
     };
-    target.endpoint.close().await;
+    close_endpoint(&target.endpoint).await;
     Ok(preview)
 }
 
@@ -152,6 +169,9 @@ pub async fn receive(
     events: mpsc::UnboundedSender<TransferEvent>,
     control: Arc<ReceiveControl>,
 ) -> Result<(String, bool)> {
+    // Wait for any running lookup (seconds) before touching the store:
+    // opening it twice concurrently hangs (see `STORE_ACCESS`).
+    let _guard = STORE_ACCESS.write().await;
     let target = connect_and_describe(ticket_text, base_dir, &control).await?;
     let from_cache = match download_with_retry(&target, &events, &control).await {
         Ok(from_cache) => from_cache,
@@ -166,6 +186,11 @@ pub async fn receive(
                 if let Err(error) = std::fs::remove_dir_all(&cache_dir) {
                     eprintln!("fly: cancel cleanup of {} failed: {error}", cache_dir.display());
                 }
+            } else if !control.was_cancelled() {
+                // No stop closed this endpoint (pause/cancel do); say
+                // goodbye explicitly so the sender frees its receiver
+                // slot at once instead of on connection timeout.
+                close_endpoint(&target.endpoint).await;
             }
             return Err(error);
         }
@@ -179,7 +204,7 @@ pub async fn receive(
     // already stopped sharing, network gone) must not fail the receive.
     notify_sender(&target.endpoint, &target.sender, target.collection).await;
     let _ = events.send(TransferEvent::Finished);
-    target.endpoint.close().await;
+    close_endpoint(&target.endpoint).await;
     Ok((target.file_name, from_cache))
 }
 
@@ -320,6 +345,18 @@ async fn probe_sender(endpoint: &Endpoint, sender: &EndpointAddr) -> Result<()> 
     .map_err(|_| anyhow!("sender unreachable"))
 }
 
+/// Shut an endpoint down without hanging the task: the graceful drain
+/// waits for peers, so it is bounded — a wedged connection must never
+/// wedge the transfer (or the receive lock it holds).
+async fn close_endpoint(endpoint: &Endpoint) {
+    if timeout(Duration::from_secs(10), endpoint.close())
+        .await
+        .is_err()
+    {
+        eprintln!("fly: endpoint close timed out; continuing");
+    }
+}
+
 /// Fetch the file blob with progress, retrying transient failures.
 /// Already-downloaded ranges are reused on retry automatically.
 /// Returns whether every byte was already cached (nothing transferred).
@@ -333,6 +370,7 @@ async fn download_with_retry(
     let mut attempt = 0u32;
     let mut done = 0u64;
     let mut from_cache = false;
+    let mut active = target.connection.clone();
     loop {
         attempt += 1;
         // Resume accounting: fetch progress counts only bytes downloaded
@@ -351,29 +389,30 @@ async fn download_with_retry(
         let _ = events.send(TransferEvent::Progress { done, total });
         // Attempt 1 reuses the metadata connection. Later attempts dial
         // fresh: after a network change the old connection is dead, and
-        // retrying on it would fail every time.
-        let fresh: Option<Connection> = if attempt == 1 {
-            None
-        } else {
-            Some(
-                timeout(
-                    CONNECT_TIMEOUT,
-                    target
-                        .endpoint
-                        .connect(target.sender.clone(), iroh_blobs::protocol::ALPN),
-                )
-                .await
-                .map_err(|_| {
-                    anyhow!(
-                        "Couldn't reach the sender (reconnect timed out). \
-                         They may have gone offline; your progress is saved, \
-                         so Resume to continue."
-                    )
-                })?
-                .context("Couldn't reach the sender")?,
+        // retrying on it would fail every time. The previous attempt's
+        // connection is closed first: it is still open and holds the
+        // sender's single receiver slot, so a redial without closing
+        // would be rejected by our own stale connection. The backoff
+        // sleep after a failed attempt gives the close time to land.
+        if attempt > 1 {
+            active.close(0u32.into(), b"retry");
+            active = timeout(
+                CONNECT_TIMEOUT,
+                target
+                    .endpoint
+                    .connect(target.sender.clone(), iroh_blobs::protocol::ALPN),
             )
-        };
-        let connection = fresh.as_ref().unwrap_or(&target.connection);
+            .await
+            .map_err(|_| {
+                anyhow!(
+                    "Couldn't reach the sender (reconnect timed out). \
+                     They may have gone offline; your progress is saved, \
+                     so Resume to continue."
+                )
+            })?
+            .context("Couldn't reach the sender")?;
+        }
+        let connection = &active;
         let progress = remote.fetch(connection.clone(), (hash, BlobFormat::Raw));
         let mut stream = progress.stream();
         let mut failed: Option<anyhow::Error> = None;
@@ -864,5 +903,243 @@ mod tests {
         assert_eq!(found.size, 13);
         started.session.shutdown().await;
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Impatient start: the receive begins while the ticket lookup still
+    /// runs. Both must succeed — the receive waits for the lookup's
+    /// short store access instead of failing on the locked cache dir.
+    #[tokio::test]
+    async fn preview_then_immediate_receive_both_succeed() {
+        let _serial = SERIAL.lock().await;
+        let base = unique_test_dir("overlap");
+        let src_dir = base.join("src");
+        let out_dir = base.join("out");
+        let cache_dir = base.join("cache");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let content: Vec<u8> = (0..65536u32).map(|i| (i.wrapping_mul(7)) as u8).collect();
+        std::fs::write(src_dir.join("input.bin"), &content).unwrap();
+
+        let (send_tx, _send_rx) = mpsc::unbounded_channel();
+        let started = share::start_share(
+            &src_dir.join("input.bin"),
+            share::TicketType::Full,
+            send_tx,
+        )
+        .await
+        .expect("share");
+        let ticket = started.ticket.clone();
+
+        // Lookup first, like a pasted ticket; wait until it has the
+        // ticket's store open, then start the receive mid-lookup.
+        let cache_clone = cache_dir.clone();
+        let ticket_clone = ticket.clone();
+        let lookup = tokio::spawn(async move { preview(&ticket_clone, &cache_clone).await });
+        let hash_hex = BlobTicket::from_str(&ticket).unwrap().hash().to_hex();
+        let store_file = cache_dir
+            .join(format!("ticket-{hash_hex}"))
+            .join("blobs.db");
+        let begin = std::time::Instant::now();
+        while !store_file.exists() && begin.elapsed() < Duration::from_secs(60) {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(store_file.exists(), "lookup never opened the store");
+
+        let (recv_tx, _recv_rx) = mpsc::unbounded_channel();
+        let received = timeout(
+            Duration::from_secs(150),
+            receive(
+                &ticket,
+                &out_dir,
+                &cache_dir,
+                recv_tx,
+                Arc::new(ReceiveControl::default()),
+            ),
+        )
+        .await
+        .expect("receive hung while a lookup ran")
+        .expect("receive must wait for the lookup, not fail on it");
+        assert_eq!(received.0, "input.bin");
+        let found = timeout(Duration::from_secs(150), lookup)
+            .await
+            .expect("lookup hung")
+            .expect("lookup task failed")
+            .expect("lookup must succeed");
+        assert_eq!(found.name, "input.bin");
+        assert_eq!(std::fs::read(out_dir.join("input.bin")).unwrap(), content);
+        started.session.shutdown().await;
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// A lookup attempted while a download runs must fail fast as busy,
+    /// never block on the minutes-long transfer (nor report a cryptic
+    /// store-lock error). The UI never triggers this — Start is disabled
+    /// during lookup — but a stray call must stay harmless.
+    #[tokio::test]
+    async fn preview_during_running_receive_is_busy_not_stuck() {
+        let _serial = SERIAL.lock().await;
+        let base = unique_test_dir("busyprobe");
+        let src_dir = base.join("src");
+        let out_dir = base.join("out");
+        let cache_dir = base.join("cache");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        // 32 MiB: big enough to still be mid-flight when the lookup lands.
+        let big: Vec<u8> = (0..(32u32 * 1024 * 1024)).map(|i| (i.wrapping_mul(11)) as u8).collect();
+        std::fs::write(src_dir.join("drop.bin"), &big).unwrap();
+        drop(big);
+
+        let (send_tx, _send_rx) = mpsc::unbounded_channel();
+        let started = share::start_share(&src_dir.join("drop.bin"), share::TicketType::Full, send_tx)
+            .await
+            .expect("share");
+        let ticket = started.ticket.clone();
+
+        let cache_clone = cache_dir.clone();
+        let out_clone = out_dir.clone();
+        let ticket_clone = ticket.clone();
+        let (first_tx, mut first_rx) = mpsc::unbounded_channel();
+        let control = Arc::new(ReceiveControl::default());
+        let task_control = control.clone();
+        let task = tokio::spawn(async move {
+            receive(&ticket_clone, &out_clone, &cache_clone, first_tx, task_control).await
+        });
+        assert!(
+            wait_for_partial(&mut first_rx).await,
+            "never saw a partial progress event"
+        );
+        let begin = std::time::Instant::now();
+        let error = timeout(Duration::from_secs(60), preview(&ticket, &cache_dir))
+            .await
+            .expect("lookup hung during a download")
+            .expect_err("lookup during a download must not run");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("busy"),
+            "lookup during a download must read as busy, got: {message}"
+        );
+        assert!(
+            begin.elapsed() < Duration::from_secs(30),
+            "busy lookup must fail fast, not block on the transfer"
+        );
+        control.cancel(CancelMode::Cancel).await;
+        let stopped = task.await.expect("task must wind down, not abort");
+        assert!(stopped.is_err(), "cancelled receive must fail");
+        started.session.shutdown().await;
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// The stall probe dials the sender's blob protocol, which takes the
+    /// single receiver slot. It must release that slot (close the probe
+    /// connection) instead of pinning it: otherwise the next dial — a
+    /// retry or a re-receive — is rejected and the sender looks busy
+    /// forever, with its connection count stuck at 1.
+    #[tokio::test]
+    async fn probe_releases_sender_slot() {
+        let _serial = SERIAL.lock().await;
+        let base = unique_test_dir("probeslot");
+        let src_dir = base.join("src");
+        let probe_dir = base.join("probecache");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(src_dir.join("input.bin"), vec![7u8; 65536]).unwrap();
+
+        let (send_tx, _send_rx) = mpsc::unbounded_channel();
+        let started = share::start_share(
+            &src_dir.join("input.bin"),
+            share::TicketType::Full,
+            send_tx,
+        )
+        .await
+        .expect("share");
+        let ticket = BlobTicket::from_str(&started.ticket).unwrap();
+        let sender = ticket.addr().clone();
+        let collection = ticket.hash();
+
+        let endpoint = build_endpoint().await.expect("endpoint");
+        probe_sender(&endpoint, &sender)
+            .await
+            .expect("live sender must be reachable");
+        // Let the probe's close land before dialing again.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let connection = timeout(
+            CONNECT_TIMEOUT,
+            endpoint.connect(sender.clone(), iroh_blobs::protocol::ALPN),
+        )
+        .await
+        .expect("redial hung")
+        .expect("redial rejected: the probe pinned the sender slot");
+        // A rejected connection serves nothing; fetch on it fails.
+        let store = Store::from(FsStore::load(&probe_dir).await.expect("probe store"));
+        let _protocol = BlobsProtocol::new(&store, None);
+        timeout(
+            METADATA_TIMEOUT,
+            fetch_to_end(&store.remote(), &connection, collection, BlobFormat::Raw),
+        )
+        .await
+        .expect("fetch hung")
+        .expect("fetch on the redial must succeed: the slot must be free");
+        endpoint.close().await;
+        started.session.shutdown().await;
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// A receiver that vanishes without goodbye (app kill, power loss)
+    /// sends no close frames; the sender still must not show it
+    /// forever. QUIC's idle timeout reaps the dead connection, so the
+    /// receiver count drops back — slowly, but bounded.
+    #[tokio::test]
+    async fn receiver_vanish_frees_sender_count() {
+        let _serial = SERIAL.lock().await;
+        let base = unique_test_dir("vanish");
+        let src_dir = base.join("src");
+        let cache_dir = base.join("cache");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(src_dir.join("input.bin"), vec![7u8; 65536]).unwrap();
+
+        let (send_tx, mut send_rx) = mpsc::unbounded_channel();
+        let started = share::start_share(
+            &src_dir.join("input.bin"),
+            share::TicketType::Full,
+            send_tx,
+        )
+        .await
+        .expect("share");
+        let control = ReceiveControl::default();
+        let target = connect_and_describe(&started.ticket, &cache_dir, &control)
+            .await
+            .expect("describe");
+        // The sender saw the receiver arrive.
+        assert!(
+            wait_for_sending(&mut send_rx, 1, Duration::from_secs(30)).await,
+            "sender never counted the receiver"
+        );
+        // Vanish: drop everything WITHOUT close, like a process kill.
+        drop(target);
+        // The count must drop back via idle timeout (~30s), not never.
+        assert!(
+            wait_for_sending(&mut send_rx, 0, Duration::from_secs(90)).await,
+            "sender still shows the vanished receiver after 90s"
+        );
+        started.session.shutdown().await;
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Drain sender events until the receiver count reads `want`, or
+    /// the deadline passes. Other events (delivery pings on unrelated
+    /// shares, ticket updates) are ignored.
+    async fn wait_for_sending(
+        rx: &mut mpsc::UnboundedReceiver<TransferEvent>,
+        want: u32,
+        limit: Duration,
+    ) -> bool {
+        let begin = std::time::Instant::now();
+        while begin.elapsed() < limit {
+            match timeout(Duration::from_secs(5), rx.recv()).await {
+                Ok(Some(TransferEvent::Sending { receivers })) if receivers == want => {
+                    return true;
+                }
+                Ok(None) => return false,
+                _ => {}
+            }
+        }
+        false
     }
 }
