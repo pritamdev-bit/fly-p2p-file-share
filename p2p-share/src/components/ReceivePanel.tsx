@@ -27,9 +27,6 @@ import {
   AlertIcon,
   FolderIcon,
   LinkIcon,
-  LockIcon,
-  ShieldIcon,
-  ZapIcon,
 } from "./icons";
 
 type Status = "idle" | "receiving" | "finished" | "error";
@@ -49,7 +46,7 @@ export default function ReceivePanel({
   const [previewError, setPreviewError] = useState("");
   const [lookingUp, setLookingUp] = useState(false);
   // Offline ticket parse (never connects): whose ticket this is, shown
-  // in the Ticket details disclosure. Failures stay silent — the
+  // in the Code details disclosure. Failures stay silent, since the
   // debounced preview reports bad tickets soon enough.
   const [ticketInfo, setTicketInfo] = useState<TicketInfo | null>(null);
   // Executable guard: opening a runnable file needs one explicit extra
@@ -62,14 +59,14 @@ export default function ReceivePanel({
   const [speed, setSpeed] = useState<number | null>(null);
   // "direct" | "relayed" | null. Shown only inside the speed line, so a
   // stale value is either hidden (no speed yet) or still true (finished
-  // keeps the pipe that carried it) — no explicit resets needed.
+  // keeps the pipe that carried it). No resets needed.
   const [path, setPath] = useState<string | null>(null);
   const [status, setStatus] = useState<Status>("idle");
   const [message, setMessage] = useState("");
   const [savedName, setSavedName] = useState<string | null>(null);
   const [fromCache, setFromCache] = useState(false);
   const [resumable, setResumable] = useState(false);
-  // Speed is the overall average since the first progress event — stable,
+  // Speed is the overall average since the first progress event: stable
   // and honest across stalls and retries. Display updates are throttled
   // so the number doesn't flicker with every progress event.
   const speedStart = useRef<{ at: number; done: number } | null>(null);
@@ -156,7 +153,7 @@ export default function ReceivePanel({
       previewTicket(value)
         .then((found) => {
           // A result that lands after a download started or finished is
-          // stale by definition — never let it overwrite live UI.
+          // stale by definition, so never let it overwrite live UI.
           const stale =
             cancelled || (statusRef.current !== "idle" && statusRef.current !== "error");
           if (stale) return;
@@ -327,7 +324,7 @@ export default function ReceivePanel({
         setStopping(null);
         setStatus("idle");
         setResumable(true);
-        setMessage("Download paused. Resume to continue.");
+        setMessage("Download paused. You can resume any time.");
       } else {
         setStopping(null);
         setStatus("error");
@@ -369,7 +366,7 @@ export default function ReceivePanel({
     <div className="view">
       <h1 className="view-title">Receive a file</h1>
       <p className="view-subtitle">
-        Enter a transfer ticket from the sender to start downloading.
+        Paste the code from the sender, then download the file.
       </p>
 
       <div className="card">
@@ -378,18 +375,18 @@ export default function ReceivePanel({
             <LinkIcon size={20} />
           </span>
           <div>
-            <h2 className="card-title">Transfer ticket</h2>
-            <p className="card-sub">Paste the ticket code from the sender.</p>
+            <h2 className="card-title">Transfer code</h2>
+            <p className="card-sub">Paste the code the sender shared with you.</p>
           </div>
         </div>
         <input
-          className="input ticket-input"
+          className="input ticket-code-field"
           value={ticket}
           onChange={(e) => {
             setTicket(e.currentTarget.value);
             if (status !== "receiving") resetForNewTicket();
           }}
-          placeholder="Paste ticket here…"
+          placeholder="Paste the code here"
           spellCheck={false}
           autoComplete="off"
         />
@@ -398,36 +395,36 @@ export default function ReceivePanel({
           onClick={handleUploadQr}
           disabled={status === "receiving"}
         >
-          Upload a QR code instead
+          Upload a QR picture instead
         </button>
         {ticketInfo && status !== "receiving" && (
           <details className="inspector">
-            <summary className="inspector-summary">Ticket details</summary>
+            <summary className="inspector-summary">Code details</summary>
             <Fingerprint value={ticketInfo.fingerprint} />
             <div className="inspector-row">
               <span className="inspector-label">Type</span>
               <span>
                 {ticketInfo.kind === "id"
-                  ? "Short — addresses resolve over discovery."
-                  : "Full — carries its own addresses."}
+                  ? "Short. The address is looked up when you connect."
+                  : "Full. The address travels with the code."}
               </span>
             </div>
             {ticketInfo.relays.map((relay) => (
               <div className="inspector-row" key={relay}>
                 <span className="inspector-label">Relay</span>
-                <code className="inspector-value">{relay}</code>
+                <code className="inspector-code">{relay}</code>
               </div>
             ))}
             {ticketInfo.addrs.map((addr) => (
               <div className="inspector-row" key={addr}>
                 <span className="inspector-label">Address</span>
-                <code className="inspector-value">{addr}</code>
+                <code className="inspector-code">{addr}</code>
               </div>
             ))}
             <div className="inspector-note">
-              Compare the fingerprint with the sender's screen before downloading —
-              only trust it if the ticket came through a channel you trust.
-              Never paste tickets into decoder websites; inspect them here.
+              Read the match code back to the sender before you download. Only
+              trust a code that came from someone you trust. Never paste codes
+              into decoder websites. Check them here.
             </div>
           </details>
         )}
@@ -436,10 +433,10 @@ export default function ReceivePanel({
             {preview ? (
               <>
                 <div className="preview-name">{fileNameOf(preview.name)}</div>
-                <div className="preview-sub">{formatBytes(preview.size)} — verified from the ticket.</div>
+                <div className="preview-sub">{formatBytes(preview.size)}. Read straight from the code.</div>
               </>
             ) : lookingUp ? (
-              <div className="preview-sub">Looking up the file…</div>
+              <div className="preview-sub">Reading the code…</div>
             ) : previewError ? (
               <div className="preview-error">{previewError}</div>
             ) : null}
@@ -464,7 +461,7 @@ export default function ReceivePanel({
               {stopping === "pause" ? "Pausing…" : "Pause"}
             </button>
             <button
-              className="btn-danger-outline btn-large"
+              className="btn-danger btn-large"
               onClick={() => void stopWith("cancel")}
               disabled={stopping !== null}
             >
@@ -476,7 +473,7 @@ export default function ReceivePanel({
             className="btn-primary btn-block btn-large"
             onClick={handleStart}
             disabled={!canStart}
-            title={lookingUp ? "Waiting for the ticket lookup…" : undefined}
+            title={lookingUp ? "Reading the code. One moment…" : undefined}
           >
             {resumable ? "Resume download" : "Start receiving"}
           </button>
@@ -489,7 +486,7 @@ export default function ReceivePanel({
             <Progress done={progress.done} total={progress.total} />
             {status === "receiving" && (
               <div className="connecting-hint">
-                Keep this device awake — if it sleeps, Resume continues where it left off.
+                Keep this device awake. If it sleeps, Resume picks up where it stopped.
               </div>
             )}
             {speed !== null && (
@@ -504,8 +501,8 @@ export default function ReceivePanel({
         {status === "finished" && (
           <div ref={finishedRef}>
             <div className="banner banner-ok" role="status">
-              Saved{savedName ? ` as ${savedName}` : ""}
-              {fromCache ? " — already downloaded, restored from cache." : "."}
+              Saved{savedName ? ` as ${savedName}.` : "."}
+              {fromCache ? " Already on this device, brought back from the cache." : ""}
             </div>
             <div className="launch-row">
               <button className="btn-ghost" onClick={handleOpen}>
@@ -561,29 +558,9 @@ export default function ReceivePanel({
         )}
       </div>
 
-      <div className="card trust-row">
-        <div className="trust-item">
-          <LockIcon size={18} />
-          <div>
-            <div className="trust-title">End-to-end encrypted</div>
-            <div className="trust-sub">Transferred directly between devices.</div>
-          </div>
-        </div>
-        <div className="trust-item">
-          <ZapIcon size={18} />
-          <div>
-            <div className="trust-title">No account needed</div>
-            <div className="trust-sub">Just a ticket code.</div>
-          </div>
-        </div>
-        <div className="trust-item">
-          <ShieldIcon size={18} />
-          <div>
-            <div className="trust-title">Verified integrity</div>
-            <div className="trust-sub">Checked as it downloads.</div>
-          </div>
-        </div>
-      </div>
+      <p className="quiet-line">
+        Encrypted end to end. No account. Checked while it downloads.
+      </p>
     </div>
   );
 }

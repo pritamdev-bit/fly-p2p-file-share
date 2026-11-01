@@ -3,13 +3,13 @@ interface Props {
   label?: string;
 }
 
-export default function Fingerprint({ value, label = "Sender fingerprint" }: Props) {
+export default function Fingerprint({ value, label = "Match code" }: Props) {
   const short =
     value.length > 20 ? `${value.slice(0, 12)}…${value.slice(-6)}` : value;
   return (
     <div className="fingerprint" title={value}>
       <span className="fingerprint-label">{label}</span>
-      <code className="fingerprint-value">{short}</code>
+      <code className="fingerprint-code">{short}</code>
     </div>
   );
 }

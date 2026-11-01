@@ -93,7 +93,7 @@ export async function loadSaveDir(): Promise<string | null> {
     const stored = window.localStorage.getItem(SAVE_DIR_KEY);
     if (stored) return stored;
   } catch {
-    // Storage unavailable (shouldn't happen in-app) — fall through.
+    // Storage unavailable (shouldn't happen in-app), fall through.
   }
   if (!isTauri()) return null;
   try {
@@ -107,7 +107,7 @@ export function storeSaveDir(dir: string): void {
   try {
     window.localStorage.setItem(SAVE_DIR_KEY, dir);
   } catch {
-    // Best effort — the folder still works for this session.
+    // Best effort: the folder still works for this session.
   }
 }
 
@@ -234,12 +234,12 @@ export function cancelReceive(): Promise<string> {
 }
 
 export function formatSpeed(bytesPerSecond: number): string {
-  if (!Number.isFinite(bytesPerSecond) || bytesPerSecond < 0) return "—";
+  if (!Number.isFinite(bytesPerSecond) || bytesPerSecond < 0) return "n/a";
   return `${formatBytes(Math.round(bytesPerSecond))}/s`;
 }
 
 export function formatEta(seconds: number): string {
-  if (!Number.isFinite(seconds) || seconds < 0) return "—";
+  if (!Number.isFinite(seconds) || seconds < 0) return "n/a";
   const total = Math.round(seconds);
   if (total < 60) return `${total}s left`;
   const minutes = Math.floor(total / 60);
@@ -308,7 +308,7 @@ export async function onFileDrop(
 }
 
 export function formatBytes(bytes: number): string {
-  if (!Number.isFinite(bytes) || bytes < 0) return "—";
+  if (!Number.isFinite(bytes) || bytes < 0) return "n/a";
   const units = ["B", "KB", "MB", "GB", "TB"];
   let value = bytes;
   let unit = 0;

@@ -4,6 +4,7 @@ import { APP_NAME, onFlyOpenUrl, takePendingTickets } from "./api";
 import Diagnostics from "./components/Diagnostics";
 import ReceivePanel from "./components/ReceivePanel";
 import SendPanel from "./components/SendPanel";
+import StorageRow from "./components/StorageRow";
 import { ArrowDownIcon, ArrowUpIcon, LogoMark } from "./components/icons";
 import "./App.css";
 
@@ -101,13 +102,7 @@ export default function App() {
           </button>
         </nav>
         <div className="sidebar-footer">
-          <div className="status-line">
-            <span className="status-dot" aria-hidden="true" />
-            <div>
-              <div className="status-title">Ready</div>
-              <div className="status-sub">Direct device-to-device</div>
-            </div>
-          </div>
+          <StorageRow />
           <button
             className="btn-ghost btn-small btn-block"
             onClick={() => setDiagnosticsOpen(true)}
@@ -162,7 +157,7 @@ export default function App() {
             </p>
             <div className="quit-actions">
               <button
-                className="btn-danger-outline"
+                className="btn-danger"
                 onClick={() => {
                   quittingRef.current = true;
                   void getCurrentWindow().destroy();

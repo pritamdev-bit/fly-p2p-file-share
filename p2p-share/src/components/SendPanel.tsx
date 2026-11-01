@@ -32,7 +32,7 @@ export default function SendPanel({
   const [share, setShare] = useState<ShareInfo | null>(null);
   const [receivers, setReceivers] = useState(0);
   // "direct" | "relayed" | null. Shown only while a receiver is
-  // connected, so staleness is impossible — no explicit resets needed.
+  // connected, so a stale value can never show. No resets needed.
   const [path, setPath] = useState<string | null>(null);
   const [status, setStatus] = useState<Status>("idle");
   const [message, setMessage] = useState("");
@@ -73,7 +73,7 @@ export default function SendPanel({
       setPath(event.data.path);
     } else if (event.event === "Delivered") {
       // Auto-clear: the backend already stopped the share, so the
-      // ticket is dead — drop it from the display (and the QR).
+      // code is dead. Drop it from the display (and the QR).
       setShare(null);
       setShowQr(false);
       setCopied(false);
@@ -81,11 +81,11 @@ export default function SendPanel({
       setTicketNote("");
       setStatus("delivered");
     } else if (event.event === "TicketUpdated") {
-      // The network changed and the backend re-minted the ticket.
-      // Anything copied or sent before is stale — say so plainly.
+      // The network changed and the backend re-minted the code.
+      // Anything copied or sent before is stale. Say so plainly.
       setShare((prev) => (prev ? { ...prev, ticket: event.data.ticket } : prev));
       setCopied(false);
-      setTicketNote("Network changed — ticket refreshed. Copy and send the new ticket.");
+      setTicketNote("The network changed, so this is a new code. Copy and send it again.");
     }
   }
 
@@ -108,7 +108,7 @@ export default function SendPanel({
   }
 
   async function sharePath(path: string) {
-    // Drops land on the hidden panel too — ignore them unless visible.
+    // Drops land on the hidden panel too, so ignore them unless visible.
     if (!activeRef.current) return;
     // Delivered no longer blocks: the backend auto-stopped the share,
     // so the slot is free and a new share can start immediately.
@@ -159,7 +159,7 @@ export default function SendPanel({
       setMessage(err instanceof Error ? err.message : String(err));
       return;
     }
-    // Auto-clear: the ticket is dead — drop it from the display.
+    // Auto-clear: the code is dead, so drop it from the display.
     setShare(null);
     setShowQr(false);
     setCopied(false);
@@ -197,7 +197,7 @@ export default function SendPanel({
     <div className="view">
       <h1 className="view-title">Send a file</h1>
       <p className="view-subtitle">
-        Share directly with another device. No cloud storage.
+        Pick a file, share the code, and keep this window open.
       </p>
 
       <div className="card file-card">
@@ -212,7 +212,7 @@ export default function SendPanel({
                 <CheckIcon size={14} /> Selected
               </span>
             ) : (
-              "Pick a file — or drop one anywhere on this window."
+              "Pick a file or drop one anywhere in this window."
             )}
           </div>
         </div>
@@ -227,43 +227,43 @@ export default function SendPanel({
 
       {!busy && (
         <div className="ticket-type-row">
-          <span className="ticket-type-label">Ticket type</span>
-          <div className="segmented" role="group" aria-label="Ticket type">
+          <span className="ticket-type-label">Code type</span>
+          <div className="segmented" role="group" aria-label="Code type">
             <button
               className={ticketType === "id" ? "segmented-active" : ""}
               onClick={() => setTicketType("id")}
-              title="Short ticket. Needs working discovery on the receiver's network."
+              title="Short code. Needs working discovery on the receiver's network."
             >
-              Short
+              Short code
             </button>
             <button
               className={ticketType === "full" ? "segmented-active" : ""}
               onClick={() => setTicketType("full")}
-              title="Longer ticket. Use this if the short one can't connect."
+              title="Full code. Use this if the short one cannot connect."
             >
-              Full
+              Full code
             </button>
           </div>
           <span className="ticket-type-hint">
             {ticketType === "id"
-              ? "Short ticket — try the full one if it can't connect."
-              : "Full ticket — works even where discovery is filtered."}
+              ? "Short codes are easy to share. If the other side cannot connect, stop and share a full code."
+              : "Full codes connect on strict networks too. They are longer."}
           </span>
         </div>
       )}
 
       {status === "preparing" && (
         <div className="banner banner-info" role="status">
-          Preparing the file… (hashing, one moment)
+          Getting the file ready. This takes a moment for big files.
         </div>
       )}
 
       {(share || status === "delivered" || status === "stopped") && (
-        <div className="share-grid">
+        <div className="slip-flow">
           {share && (
-            <div className="card">
-              <h2 className="card-title">Share this ticket</h2>
-              <p className="card-sub">Only share it with the person receiving this file.</p>
+            <div className="card slip">
+              <h2 className="card-title">Share this code</h2>
+              <p className="card-sub">Send it to one person you trust.</p>
               <div className="ticket-row">
                 <code className="ticket-code" title={share.ticket}>
                   {truncateMiddle(share.ticket)}
@@ -298,7 +298,7 @@ export default function SendPanel({
                     dangerouslySetInnerHTML={{ __html: qrSvg }}
                   />
                   <div className="qr-hint">
-                    Scan with any phone or QR reader to open the receive link.
+                    The other side points any QR reader at this.
                   </div>
                 </div>
               )}
@@ -307,13 +307,14 @@ export default function SendPanel({
                   {ticketNote}
                 </div>
               )}
+              <div className="slip-perforation" aria-hidden="true" />
               <Fingerprint value={share.fingerprint} />
               <div className="banner banner-warn">
                 <AlertIcon size={16} />
-                Anyone with this ticket can download this file.
+                Anyone with this code can download this file.
               </div>
               <button
-                className="btn-danger-outline btn-block"
+                className="btn-danger btn-block"
                 onClick={handleStop}
               >
                 Stop sharing
@@ -323,8 +324,8 @@ export default function SendPanel({
 
           <div className="card status-card">
             <h2 className="status-heading">
-              {status === "sharing" && (receivers > 0 ? `Sending…${path ? ` · ${path === "direct" ? "Direct" : "Relayed"}` : ""}` : "Waiting for receiver")}
-              {status === "delivered" && "Download complete"}
+              {status === "sharing" && (receivers > 0 ? `Sending…${path ? ` · ${path === "direct" ? "Direct" : "Relayed"}` : ""}` : "Waiting for the other side")}
+              {status === "delivered" && "Delivered"}
               {status === "stopped" && "Sharing stopped"}
               {status === "error" && "Something went wrong"}
               {status === "idle" && "Ready"}
@@ -332,10 +333,10 @@ export default function SendPanel({
             <p className="card-sub">
               {status === "sharing" &&
                 (receivers > 0
-                  ? `${receivers} receiver connected — keep this app open and the device awake.`
-                  : "Send the ticket to begin the transfer.")}
+                  ? `${receivers} ${receivers === 1 ? "person" : "people"} connected. Keep this app open and the device awake.`
+                  : "Send the code to begin the transfer.")}
               {status === "delivered" &&
-                "The receiver got the file. Share another whenever you're ready."}
+                "The other side got the file. Share another whenever you are ready."}
               {status === "stopped" && message}
             </p>
             {status === "delivered" && (
@@ -343,15 +344,15 @@ export default function SendPanel({
                 <span className="deliver-pop" aria-hidden="true">
                   <CheckIcon size={20} />
                 </span>
-                Delivered — sharing stopped automatically.
+                Delivered. Sharing stopped by itself.
               </div>
             )}
             <div className="note-row">
               <LockIcon size={16} />
               <div>
-                <div className="note-title">Encrypted connection</div>
+                <div className="note-title">Encrypted end to end</div>
                 <div className="note-sub">
-                  Direct connection when possible, relay used if needed.
+                  Direct when possible, relayed when needed.
                 </div>
               </div>
             </div>
@@ -376,7 +377,7 @@ export default function SendPanel({
           <div className="drop-overlay-inner">
             <FileIcon size={30} />
             <div className="drop-overlay-title">Drop to send this file</div>
-            <div className="drop-overlay-sub">One file at a time in v1.</div>
+            <div className="drop-overlay-sub">One file at a time for now.</div>
           </div>
         </div>
       )}

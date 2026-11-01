@@ -93,7 +93,7 @@ async fn connect_and_describe(
     // works, short fails" almost always means filtered DNS.
     let id_kind = ticket.addr().addrs.is_empty();
     let dns_hint = if id_kind {
-        " This is a short ticket, which finds the sender over discovery (DNS/Pkarr) — if a full ticket from the same sender works but this fails, your network may be filtering DNS."
+        " This is a short ticket, which finds the sender over discovery (DNS/Pkarr). If a full ticket from the same sender works but this fails, your network may be filtering DNS."
     } else {
         ""
     };
@@ -159,7 +159,7 @@ async fn connect_and_describe(
 pub async fn preview(ticket_text: &str, base_dir: &Path) -> Result<FilePreview> {
     let _guard = STORE_ACCESS
         .try_read()
-        .map_err(|_| anyhow!("Lookup is busy — a download is using the transfer cache."))?;
+        .map_err(|_| anyhow!("Lookup is busy: a download is using the transfer cache."))?;
     // Previews are short and not user-cancellable; the control is a dummy.
     let control = ReceiveControl::default();
     let target = connect_and_describe(ticket_text, base_dir, &control).await?;
