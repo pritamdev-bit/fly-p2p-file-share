@@ -27,6 +27,7 @@ use tokio::sync::mpsc;
 pub struct ShareInfo {
     pub ticket: String,
     pub fingerprint: String,
+    pub port: Option<u16>,
 }
 
 enum ShareSlot {
@@ -240,6 +241,7 @@ pub async fn send_file(
                     let info = ShareInfo {
                         ticket: started.ticket,
                         fingerprint: started.fingerprint,
+                        port: started.port,
                     };
                     *slot = ShareSlot::Active(started.session);
                     PostStart::Keep(info)

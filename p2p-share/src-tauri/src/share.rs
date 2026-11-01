@@ -205,16 +205,25 @@ fn relay_mode_for(value: Option<&str>) -> RelayMode {
     RelayMode::Custom(iroh::RelayMap::from_iter(urls))
 }
 
+/// The UDP port fly listens on out of the box: nobody configures
+/// anything, and anyone who wants direct connections forwards this one
+/// port on their router. `FLY_PORT` overrides it (`0` means a random
+/// ephemeral port). Forwarding only matters on the dialed side (the
+/// sender); the relay stays as the automatic fallback either way.
+pub(crate) const DEFAULT_PORT: u16 = 7823;
+
 /// Env override for strict NATs: `FLY_PORT` pins the endpoint's UDP port,
 /// so one router port-forward lets the other side dial straight in
-/// (a symmetric NAT otherwise forces relayed traffic). Unset, blank, or
-/// garbage means an ephemeral port, exactly as before. Forwarding only
-/// matters on the dialed side (the sender); the relay stays as the
-/// automatic fallback either way.
+/// (a symmetric NAT otherwise forces relayed traffic). Unset or blank
+/// means the default port; garbage warns and falls back to ephemeral
+/// instead of breaking the share.
 fn fixed_port_for(value: Option<&str>) -> Option<u16> {
-    let raw = value?.trim();
+    let raw = match value {
+        None => return Some(DEFAULT_PORT),
+        Some(raw) => raw.trim(),
+    };
     if raw.is_empty() {
-        return None;
+        return Some(DEFAULT_PORT);
     }
     match raw.parse::<u16>() {
         Ok(0) | Err(_) => {
@@ -254,19 +263,25 @@ fn endpoint_builder(port: Option<u16>) -> Result<Builder> {
     Ok(builder)
 }
 
-/// Build a fresh ephemeral endpoint: N0 preset (DNS/Pkarr discovery only,
+/// Build a fresh endpoint: N0 preset (DNS/Pkarr discovery only,
 /// no DHT/mDNS), default relay map (or `FLY_RELAY_URL` when set), proxy
 /// from environment, no UPnP gateway probing (pre-launch proposal:
-/// disabled), ephemeral UDP port (or `FLY_PORT` when set).
+/// disabled), fixed UDP port (or `FLY_PORT` when set).
 ///
 /// A new identity is generated per call, so every share (and every receive)
 /// gets a fresh endpoint ID. That is stricter than the plan's per-launch
 /// default, and each ticket is independent anyway.
 pub(crate) async fn build_endpoint() -> Result<Endpoint> {
-    build_endpoint_with(fixed_port_for(std::env::var("FLY_PORT").ok().as_deref())).await
+    build_endpoint_with(fixed_port_for(std::env::var("FLY_PORT").ok().as_deref()))
+        .await
+        .map(|(endpoint, _)| endpoint)
 }
 
-async fn build_endpoint_with(port: Option<u16>) -> Result<Endpoint> {
+/// The endpoint plus the fixed port it holds, if any: `None` means an
+/// ephemeral port (explicitly requested, or a taken fixed port that fell
+/// back). Callers that report the port (the share UI) use this, so a
+/// fallback never advertises a port the app does not hold.
+async fn build_endpoint_with(port: Option<u16>) -> Result<(Endpoint, Option<u16>)> {
     match endpoint_builder(port)?.bind().await {
         Ok(endpoint) => {
             if let Some(port) = port {
@@ -274,16 +289,17 @@ async fn build_endpoint_with(port: Option<u16>) -> Result<Endpoint> {
                     "fly: listening on fixed UDP port {port} (forward it for direct connections)"
                 );
             }
-            Ok(endpoint)
+            Ok((endpoint, port))
         }
         // A taken fixed port must never break a share: warn loudly and
-        // retry with an ephemeral port, exactly the default behavior.
+        // retry with an ephemeral port, exactly the old behavior.
         Err(err) if port.is_some() => {
             eprintln!("fly: fixed UDP port unavailable ({err:#}); using a random port");
-            endpoint_builder(None)?
+            let endpoint = endpoint_builder(None)?
                 .bind()
                 .await
-                .context("failed to bind P2P endpoint")
+                .context("failed to bind P2P endpoint")?;
+            Ok((endpoint, None))
         }
         Err(err) => Err(err).context("failed to bind P2P endpoint"),
     }
@@ -338,6 +354,7 @@ pub struct StartedShare {
     pub session: ShareSession,
     pub ticket: String,
     pub fingerprint: String,
+    pub port: Option<u16>,
 }
 
 pub async fn start_share(
@@ -349,7 +366,8 @@ pub async fn start_share(
     // Best-effort: drop orphaned sender workspaces older than the TTL
     // (crashes/kills leave them behind; Stop sharing deletes its own).
     prune::prune_old_dirs(&std::env::temp_dir(), "fly-send-", prune::CACHE_TTL);
-    let endpoint = build_endpoint().await?;
+    let (endpoint, port) =
+        build_endpoint_with(fixed_port_for(std::env::var("FLY_PORT").ok().as_deref())).await?;
     let temp_dir = unique_temp_dir("fly-send-")?;
     std::fs::create_dir_all(&temp_dir).context("cannot create sender workspace")?;
     // Disk-backed store (never in-memory): flat memory for any file size.
@@ -409,6 +427,7 @@ pub async fn start_share(
         },
         ticket,
         fingerprint,
+        port,
     })
 }
 
@@ -599,19 +618,20 @@ mod tests {
         }
     }
 
-    /// Unset/blank means an ephemeral port; a bare number pins it; zero
-    /// and garbage warn and fall back instead of breaking shares.
+    /// Unset/blank means the default port; a bare number pins it; zero
+    /// and garbage warn and fall back to ephemeral instead of breaking
+    /// shares.
     #[test]
     fn fixed_port_parses() {
-        assert_eq!(fixed_port_for(None), None);
-        assert_eq!(fixed_port_for(Some("")), None);
-        assert_eq!(fixed_port_for(Some("   ")), None);
+        assert_eq!(fixed_port_for(None), Some(DEFAULT_PORT));
+        assert_eq!(fixed_port_for(Some("")), Some(DEFAULT_PORT));
+        assert_eq!(fixed_port_for(Some("   ")), Some(DEFAULT_PORT));
         assert_eq!(fixed_port_for(Some("0")), None);
         assert_eq!(fixed_port_for(Some("abc")), None);
         assert_eq!(fixed_port_for(Some("99999")), None);
         assert_eq!(fixed_port_for(Some("-1")), None);
         assert_eq!(fixed_port_for(Some("7823")), Some(7823));
-        assert_eq!(fixed_port_for(Some("  7823  ")), Some(7823));
+        assert_eq!(fixed_port_for(Some("  9000  ")), Some(9000));
     }
 
     /// A fixed port that is already taken must never break endpoint
@@ -620,7 +640,7 @@ mod tests {
     async fn fixed_port_taken_falls_back_to_ephemeral() {
         let taken = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let port = taken.local_addr().unwrap().port();
-        let endpoint = build_endpoint_with(Some(port))
+        let (endpoint, _) = build_endpoint_with(Some(port))
             .await
             .expect("taken fixed port must fall back to ephemeral");
         endpoint.close().await;
@@ -634,9 +654,10 @@ mod tests {
         let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let port = probe.local_addr().unwrap().port();
         drop(probe);
-        let endpoint = build_endpoint_with(Some(port))
+        let (endpoint, pinned) = build_endpoint_with(Some(port))
             .await
             .expect("free fixed port must bind");
+        assert_eq!(pinned, Some(port), "fixed bind must report its port");
         // Probe the wildcard, not loopback: Windows lets a loopback bind
         // overlap a wildcard one, but two wildcards always conflict.
         let clash = std::net::UdpSocket::bind(SocketAddr::new(

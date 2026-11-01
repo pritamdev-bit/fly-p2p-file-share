@@ -309,6 +309,12 @@ export default function SendPanel({
               )}
               <div className="slip-perforation" aria-hidden="true" />
               <Fingerprint value={share.fingerprint} />
+              {share.port != null && (
+                <div className="port-hint">
+                  Listening on UDP port {share.port}. If the other side shows
+                  Relayed, forwarding this port on your router can make it Direct.
+                </div>
+              )}
               <div className="banner banner-warn">
                 <AlertIcon size={16} />
                 Anyone with this code can download this file.

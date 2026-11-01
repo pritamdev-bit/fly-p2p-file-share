@@ -24,7 +24,7 @@ machines (or VMs) can check. Run it before every tester handoff.
 | T4 | Double receive | Receive the same file twice into one folder | Second saves as `name (1).ext`; banner + Open use the real name |
 | T5 | Full disk | Receive a file bigger than free space | Refused **before** downloading, with the needed/available amounts |
 | T6 | Sender death | Kill the sender app mid-transfer | Receiver reports "sender went offline" promptly with progress saved; Resume works when the sender is back |
-| T7 | Fixed port (FLY_PORT) | Sender: set FLY_PORT=7823, forward UDP 7823 on its router, share; receiver on a strict NAT receives | Path shows Direct; without the forward it falls back to Relayed; a taken port warns in the console and the share still works |
+| T7 | Fixed port | Sender shares (fly listens on UDP 7823, shown on the slip); forward UDP 7823 on the sender's router; receiver on a strict NAT receives | Path shows Direct; without the forward it falls back to Relayed; a taken port falls back to a random port and the share still works |
 
 ## Interruptions
 

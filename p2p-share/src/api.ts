@@ -21,6 +21,8 @@ export type TransferEvent =
 export interface ShareInfo {
   ticket: string;
   fingerprint: string;
+  /** Fixed UDP port the share listens on, if any (null: random port). */
+  port: number | null;
 }
 
 /** `id`: short, needs working discovery. `full`: longer, works anywhere. */

@@ -453,6 +453,13 @@ button:focus-visible {
   margin: 14px 0;
 }
 
+.port-hint {
+  margin-top: 10px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-mute);
+}
+
 .fingerprint {
   display: flex;
   align-items: center;
