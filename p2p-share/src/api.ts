@@ -14,7 +14,8 @@ export type TransferEvent =
   | { event: "Sending"; data: { receivers: number } }
   | { event: "Finished" }
   | { event: "Delivered" }
-  | { event: "TicketUpdated"; data: { ticket: string } };
+  | { event: "TicketUpdated"; data: { ticket: string } }
+  | { event: "Path"; data: { path: string } };
 
 /** Returned by `send_file`: what the UI needs once a share starts. */
 export interface ShareInfo {

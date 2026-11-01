@@ -8,7 +8,7 @@ use crate::{events::TransferEvent, prune};
 use anyhow::{Context, Result, anyhow, bail};
 use iroh::{
     Endpoint, EndpointAddr, RelayMode, SecretKey, Watcher,
-    endpoint::{Connection, PortmapperConfig, presets},
+    endpoint::{Connection, PathEvent, PortmapperConfig, presets},
     protocol::{AcceptError, ProtocolHandler, Router},
 };
 use iroh_blobs::{
@@ -127,6 +127,7 @@ impl ProtocolHandler for CappedProtocol {
         };
         let receivers = self.gate.active.fetch_add(1, Ordering::SeqCst) + 1;
         let _ = self.gate.events.send(TransferEvent::Sending { receivers });
+        watch_connection_path(&connection, self.gate.events.clone());
         let result = self.inner.accept(connection).await;
         let receivers = self.gate.active.fetch_sub(1, Ordering::SeqCst) - 1;
         let _ = self.gate.events.send(TransferEvent::Sending { receivers });
@@ -174,9 +175,39 @@ impl ProtocolHandler for DoneHandler {
     }
 }
 
+/// Env override for self-hosters: `FLY_RELAY_URL` holds one relay URL
+/// (or several, comma-separated) that endpoints home to instead of
+/// n0's public relays. Empty or unset means the default map;
+/// unparseable entries warn and are skipped. This covers relayed
+/// traffic only — short-ticket discovery still uses the N0 preset's
+/// DNS/Pkarr. Sender and receiver should use the same relay set.
+/// Prefer FQDN form (`https://relay.example.com./`): bare hostnames
+/// stall on networks with slow DNS search domains.
+fn relay_mode_for(value: Option<&str>) -> RelayMode {
+    let mut urls = Vec::new();
+    if let Some(value) = value {
+        for part in value.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            match part.parse::<iroh::RelayUrl>() {
+                Ok(url) => urls.push(url),
+                Err(_) => eprintln!("fly: ignoring unparseable relay URL {part:?}"),
+            }
+        }
+    }
+    if urls.is_empty() {
+        return RelayMode::Default;
+    }
+    eprintln!("fly: using custom relays {urls:?}");
+    RelayMode::Custom(iroh::RelayMap::from_iter(urls))
+}
+
 /// Build a fresh ephemeral endpoint: N0 preset (DNS/Pkarr discovery only,
-/// no DHT/mDNS), default relay map, proxy from environment, no UPnP
-/// gateway probing (pre-launch proposal: disabled).
+/// no DHT/mDNS), default relay map (or `FLY_RELAY_URL` when set), proxy
+/// from environment, no UPnP gateway probing (pre-launch proposal:
+/// disabled).
 ///
 /// A new identity is generated per call, so every share (and every receive)
 /// gets a fresh endpoint ID. That is stricter than the plan's per-launch
@@ -188,12 +219,59 @@ pub(crate) async fn build_endpoint() -> Result<Endpoint> {
             iroh_blobs::protocol::ALPN.to_vec(),
             DONE_ALPN.to_vec(),
         ])
-        .relay_mode(RelayMode::Default)
+        .relay_mode(relay_mode_for(
+            std::env::var("FLY_RELAY_URL").ok().as_deref(),
+        ))
         .proxy_from_env()
         .portmapper_config(PortmapperConfig::Disabled)
         .bind()
         .await
         .context("failed to bind P2P endpoint")
+}
+
+/// Which pipe carries `connection`, from its selected path: "direct"
+/// for an IP path, "relayed" otherwise. None while no path is
+/// selected yet.
+pub(crate) fn connection_path(connection: &Connection) -> Option<&'static str> {
+    connection
+        .paths()
+        .iter()
+        .find(|path| path.is_selected())
+        .map(|path| if path.is_ip() { "direct" } else { "relayed" })
+}
+
+/// Report the current path now, then watch for path changes until the
+/// connection closes (hole-punching can upgrade mid-transfer).
+/// Best-effort: a dead event channel just ends the watch.
+pub(crate) fn watch_connection_path(
+    connection: &Connection,
+    events: mpsc::UnboundedSender<TransferEvent>,
+) {
+    if let Some(path) = connection_path(connection) {
+        let _ = events.send(TransferEvent::Path {
+            path: path.to_string(),
+        });
+    }
+    let mut path_events = connection.path_events();
+    tokio::spawn(async move {
+        while let Some(event) = path_events.next().await {
+            if let PathEvent::Selected { remote_addr, .. } = event {
+                let path = if remote_addr.is_ip() {
+                    "direct"
+                } else {
+                    "relayed"
+                };
+                if events
+                    .send(TransferEvent::Path {
+                        path: path.to_string(),
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }
+    });
 }
 
 pub struct StartedShare {
@@ -430,5 +508,34 @@ mod tests {
             mint_ticket(&after, TicketType::Full, hash),
             "full tickets must change with addresses"
         );
+    }
+
+    /// Unset/blank means n0's default relays; a URL means a custom
+    /// single-relay map; garbage warns and falls back instead of
+    /// breaking endpoint creation.
+    #[test]
+    fn relay_env_selects_map() {
+        assert!(matches!(relay_mode_for(None), RelayMode::Default));
+        assert!(matches!(relay_mode_for(Some("")), RelayMode::Default));
+        assert!(matches!(
+            relay_mode_for(Some("   ")),
+            RelayMode::Default
+        ));
+        assert!(matches!(
+            relay_mode_for(Some("not a url at all !!!")),
+            RelayMode::Default
+        ));
+        match relay_mode_for(Some("https://relay.example.com")) {
+            RelayMode::Custom(map) => assert_eq!(map.len(), 1),
+            _ => panic!("URL must select a custom map"),
+        }
+        // Comma-separated lists build a failover map; blank and
+        // garbage entries are skipped without breaking the rest.
+        match relay_mode_for(Some(
+            "https://one.example.com./, , not a url, https://two.example.com./",
+        )) {
+            RelayMode::Custom(map) => assert_eq!(map.len(), 2),
+            _ => panic!("URL list must select a custom map"),
+        }
     }
 }

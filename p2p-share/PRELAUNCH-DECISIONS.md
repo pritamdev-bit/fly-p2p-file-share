@@ -6,7 +6,7 @@ marked DECIDED.
 
 | # | Decision | Plan default / proposal | Status |
 |---|---|---|---|
-| 1 | Relay tier | Paid Shared/Dedicated or self-hosted (`RelayMode::Custom`). Public n0 relays are dev/test-only (rate-limited, no SLA/privacy). | PROPOSED |
+| 1 | Relay tier | Paid Shared/Dedicated or self-hosted (`RelayMode::Custom`, wired to `FLY_RELAY_URL`). Public n0 relays are dev/test-only (rate-limited, no SLA/privacy). | PROPOSED — support shipped, tier choice pending (see below) |
 | 2 | Updater channel | Ship Tauri updater (signatures mandatory; guard `TAURI_SIGNING_PRIVATE_KEY`) or record an explicit no. Until one exists, version checks point at a download page. | PROPOSED |
 | 3 | Node identity lifetime | Ephemeral key per launch (bounds ticket lifetime, no long-term trackable identity). | PROPOSED |
 | 4 | UPnP/NAT-PMP port mapping | Disabled (rely on hole-punching + relay) — or disclose that the app asks the gateway for a port. | PROPOSED |
@@ -14,3 +14,31 @@ marked DECIDED.
 | 6 | Receiver / session caps | Max 1 concurrent receiver in v1; auto-stop serving after first completed download; consider session-lifetime option. | PROPOSED |
 
 References: plan sections 4, 6, 9 and `../p2p-file-transfer-research.md` (I6, I9, I12, V2, V6, V7, V11, V12, V14).
+
+## 1. Relay hosting (detail)
+
+**Status:** code support shipped; tier choice still the owner's call.
+Recommendation: stay on n0's public relays through the tester phase,
+move to paid Shared/Dedicated or self-hosted before public launch.
+
+**What the relay sees (either tier).** File bytes are end-to-end
+encrypted (QUIC TLS between sender and receiver): a relay operator can
+never see file names or contents. It does see metadata: both endpoint
+IDs, connection timing and duration, bytes transferred, and IP
+addresses. Direct (hole-punched) transfers cost the relay nothing
+beyond introduction; relayed transfers cost it bandwidth — hence rate
+limits on the public tier and metering (or your own server bill) on
+paid/self-hosted.
+
+**Scope of `FLY_RELAY_URL`.** One URL, or several comma-separated for
+failover; sender and receiver should use the same set. It switches
+relayed traffic only — short-ticket discovery still uses n0's
+DNS/Pkarr, so discovery metadata stays with n0 either way. Prefer FQDN
+form with a trailing dot (`https://relay.example.com./`): bare
+hostnames stall on networks with slow DNS search domains (observed in
+tests). Serve real TLS from the relay; there is intentionally no
+insecure-test knob.
+
+**Self-host pointers.** The `iroh-relay` crate we already depend on is
+the server; n0's relay docs cover deployment. Budget for bandwidth on
+top of the box: every relayed byte transits it.

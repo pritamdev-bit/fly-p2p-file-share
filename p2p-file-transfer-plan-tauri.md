@@ -242,7 +242,7 @@ Rust tips:
 
 ### Phase 5: Optional polish (1-2 weeks, pick what you need)
 
-- [ ] **Relay/discovery hosting — decided before launch:** paid Shared/Dedicated or self-hosted (`RelayMode::Custom`, self-host guide exists). Bandwidth costs for relayed transfers, so consider limits. Either way, document the metadata-visibility tradeoff.
+- [ ] **Relay/discovery hosting — decided before launch:** paid Shared/Dedicated or self-hosted (`RelayMode::Custom`, self-host guide exists). Bandwidth costs for relayed transfers, so consider limits. Either way, document the metadata-visibility tradeoff. (Progress: `FLY_RELAY_URL` support + failover shipped with tests; tradeoff documented in `p2p-share/PRELAUNCH-DECISIONS.md`. Tier choice still pending.)
 - [ ] **Folders:** collections support them with the same libraries; reimplement the pattern from the read-only reference.
 - [ ] **Accept/reject on the sender side:** not possible with the simple pull model. This is the main reason to consider approach B.
 - [ ] **Same-network mDNS fast path:** skip public discovery on the LAN. Deliberately off by default (privacy); a later enhancement.

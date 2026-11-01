@@ -31,6 +31,9 @@ export default function SendPanel({
   const [ticketType, setTicketType] = useState<TicketType>("id");
   const [share, setShare] = useState<ShareInfo | null>(null);
   const [receivers, setReceivers] = useState(0);
+  // "direct" | "relayed" | null. Shown only while a receiver is
+  // connected, so staleness is impossible — no explicit resets needed.
+  const [path, setPath] = useState<string | null>(null);
   const [status, setStatus] = useState<Status>("idle");
   const [message, setMessage] = useState("");
   const [copied, setCopied] = useState(false);
@@ -62,10 +65,12 @@ export default function SendPanel({
   }, [status, onBusyChange]);
 
   function handleEvent(event: TransferEvent) {
-    // The sender only ever hears Sending + Delivered + TicketUpdated:
+    // The sender only ever hears Sending + Delivered + TicketUpdated + Path:
     // pulls are receiver-driven, so no sender-side progress exists.
     if (event.event === "Sending") {
       setReceivers(event.data.receivers);
+    } else if (event.event === "Path") {
+      setPath(event.data.path);
     } else if (event.event === "Delivered") {
       // Auto-clear: the backend already stopped the share, so the
       // ticket is dead — drop it from the display (and the QR).
@@ -318,7 +323,7 @@ export default function SendPanel({
 
           <div className="card status-card">
             <h2 className="status-heading">
-              {status === "sharing" && (receivers > 0 ? "Sending…" : "Waiting for receiver")}
+              {status === "sharing" && (receivers > 0 ? `Sending…${path ? ` · ${path === "direct" ? "Direct" : "Relayed"}` : ""}` : "Waiting for receiver")}
               {status === "delivered" && "Download complete"}
               {status === "stopped" && "Sharing stopped"}
               {status === "error" && "Something went wrong"}

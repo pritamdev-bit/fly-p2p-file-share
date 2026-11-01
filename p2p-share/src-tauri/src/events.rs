@@ -21,6 +21,11 @@ pub enum TransferEvent {
     /// replaces the displayed ticket and tells the user to re-send it.
     /// Only full tickets go stale; id tickets carry no addresses.
     TicketUpdated { ticket: String },
+    /// Which pipe carries the transfer: "direct" or "relayed". Emitted
+    /// when each connection's path is first known and whenever the
+    /// selected path changes mid-transfer (hole-punching can upgrade a
+    /// relayed start to direct). Both sides emit their own view.
+    Path { path: String },
     // Failures travel as command `Err` strings, not events. Phase 4 may add:
     // WaitingForReceiver, fingerprint + diagnostics payloads.
 }

@@ -60,6 +60,10 @@ export default function ReceivePanel({
     null,
   );
   const [speed, setSpeed] = useState<number | null>(null);
+  // "direct" | "relayed" | null. Shown only inside the speed line, so a
+  // stale value is either hidden (no speed yet) or still true (finished
+  // keeps the pipe that carried it) — no explicit resets needed.
+  const [path, setPath] = useState<string | null>(null);
   const [status, setStatus] = useState<Status>("idle");
   const [message, setMessage] = useState("");
   const [savedName, setSavedName] = useState<string | null>(null);
@@ -214,6 +218,8 @@ export default function ReceivePanel({
           setSpeed((done - speedStart.current.done) / elapsed);
         }
       }
+    } else if (event.event === "Path") {
+      setPath(event.data.path);
     } else if (event.event === "Finished") {
       setStatus("finished");
       setResumable(false);
@@ -490,6 +496,7 @@ export default function ReceivePanel({
               <div className="speed-line">
                 {formatSpeed(speed)}
                 {eta ? ` · ${eta}` : ""}
+                {path ? ` · ${path === "direct" ? "Direct" : "Relayed"}` : ""}
               </div>
             )}
           </div>

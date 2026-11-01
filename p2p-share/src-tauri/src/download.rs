@@ -455,6 +455,9 @@ async fn download_with_retry(
             .context("Couldn't reach the sender")?;
         }
         let connection = &active;
+        // Report which pipe carries this attempt (and any mid-transfer
+        // path upgrade) so the UI can show direct vs relayed live.
+        crate::share::watch_connection_path(connection, events.clone());
         let progress = remote.fetch(connection.clone(), (hash, BlobFormat::Raw));
         let mut stream = progress.stream();
         let mut failed: Option<anyhow::Error> = None;
@@ -551,6 +554,8 @@ mod tests {
                         return true;
                     }
                 }
+                // Path reports interleave with progress; ignore them.
+                Ok(Some(TransferEvent::Path { .. })) => {}
                 _ => return false,
             }
         }
@@ -1247,6 +1252,220 @@ mod tests {
             message.contains("DNS"),
             "short-ticket failure must name DNS, got: {message}"
         );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// RAII env override for tests: restores the previous value (or
+    /// absence) on drop, so a panicking test cannot leak config into
+    /// later serial tests.
+    struct EnvGuard {
+        key: &'static str,
+        prev: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let prev = std::env::var(key).ok();
+            // SAFETY: SERIAL-serialized tests are the only readers of
+            // this var in the test binary, so no concurrent access.
+            unsafe { std::env::set_var(key, value) };
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: same as above.
+            unsafe {
+                match self.prev.take() {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    /// Both sides report the pipe they agree on: every report is a
+    /// valid value, and the two views of the same connection share at
+    /// least one. Which pipe wins the race (direct vs relay) depends on
+    /// the network, so the test asserts agreement, not a side. A grace
+    /// drain follows the transfer because a hole-punch upgrade can land
+    /// just after the last byte.
+    #[tokio::test]
+    async fn path_events_agree_both_sides() {
+        let _serial = SERIAL.lock().await;
+        let base = unique_test_dir("pathdirect");
+        let src_dir = base.join("src");
+        let out_dir = base.join("out");
+        let cache_dir = base.join("cache");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let content: Vec<u8> = (0..65536u32).map(|i| (i.wrapping_mul(7)) as u8).collect();
+        std::fs::write(src_dir.join("input.bin"), &content).unwrap();
+
+        let (send_tx, mut send_rx) = mpsc::unbounded_channel();
+        let started = share::start_share(
+            &src_dir.join("input.bin"),
+            share::TicketType::Full,
+            send_tx,
+        )
+        .await
+        .expect("share");
+        let (recv_tx, mut recv_rx) = mpsc::unbounded_channel();
+        let (name, _) = receive(
+            &started.ticket,
+            &out_dir,
+            &cache_dir,
+            recv_tx,
+            Arc::new(ReceiveControl::default()),
+        )
+        .await
+        .expect("receive");
+        assert_eq!(name, "input.bin");
+        assert_eq!(
+            std::fs::read(out_dir.join("input.bin")).unwrap(),
+            content
+        );
+        let mut views = Vec::new();
+        for (side, rx) in [("receiver", &mut recv_rx), ("sender", &mut send_rx)] {
+            let paths = drain_paths(rx).await;
+            assert!(!paths.is_empty(), "{side} never reported its path");
+            for path in &paths {
+                assert!(
+                    path == "direct" || path == "relayed",
+                    "{side} reported a bogus path: {path:?}"
+                );
+            }
+            views.push(paths);
+        }
+        let agree = views[0].iter().any(|path| views[1].contains(path));
+        assert!(
+            agree,
+            "sides disagree on the pipe: {:?} vs {:?}",
+            views[0],
+            views[1]
+        );
+        started.session.shutdown().await;
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Drain path reports for a few seconds past the transfer.
+    async fn drain_paths(rx: &mut mpsc::UnboundedReceiver<TransferEvent>) -> Vec<String> {
+        let mut paths = Vec::new();
+        let begin = std::time::Instant::now();
+        while begin.elapsed() < Duration::from_secs(3) {
+            match timeout(Duration::from_millis(500), rx.recv()).await {
+                Ok(Some(TransferEvent::Path { path })) => paths.push(path),
+                Ok(_) => {}
+                Err(_) => {}
+            }
+        }
+        // Plus anything already queued without waiting.
+        while let Ok(event) = rx.try_recv() {
+            if let TransferEvent::Path { path } = event {
+                paths.push(path);
+            }
+        }
+        paths
+    }
+
+    /// A connection that can only use the relay (no direct addresses
+    /// to dial) classifies as relayed. Exercises the relayed branch of
+    /// the path indicator against a real relay; both ends are pinned to
+    /// it so the dial cannot wander to another home relay.
+    #[tokio::test]
+    async fn relay_only_dial_reports_relayed_path() {
+        let _serial = SERIAL.lock().await;
+        let _env = EnvGuard::set("FLY_RELAY_URL", "https://euc1-1.relay.n0.iroh.link./");
+        let base = unique_test_dir("pathrelayed");
+        let src_dir = base.join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(src_dir.join("input.bin"), vec![7u8; 1024]).unwrap();
+
+        let (send_tx, _send_rx) = mpsc::unbounded_channel();
+        let started = share::start_share(
+            &src_dir.join("input.bin"),
+            share::TicketType::Full,
+            send_tx,
+        )
+        .await
+        .expect("share");
+        let ticket = BlobTicket::from_str(&started.ticket).unwrap();
+        let relay_url: iroh::RelayUrl = "https://euc1-1.relay.n0.iroh.link./".parse().unwrap();
+        let addr = EndpointAddr::from_parts(
+            ticket.addr().id,
+            [iroh::TransportAddr::Relay(relay_url)],
+        );
+        let endpoint = build_endpoint().await.expect("endpoint");
+        let connection = timeout(
+            CONNECT_TIMEOUT,
+            endpoint.connect(addr, iroh_blobs::protocol::ALPN),
+        )
+        .await
+        .expect("relay dial hung")
+        .expect("relay dial failed");
+        let begin = std::time::Instant::now();
+        let mut classified = None;
+        while begin.elapsed() < Duration::from_secs(15) {
+            if let Some(path) = share::connection_path(&connection) {
+                classified = Some(path);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        assert_eq!(
+            classified,
+            Some("relayed"),
+            "relay-only dial must classify as relayed"
+        );
+        endpoint.close().await;
+        started.session.shutdown().await;
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// End-to-end proof that `FLY_RELAY_URL` is honored: with the env
+    /// pointing at explicit relays, a share + receive still completes.
+    /// It names public n0 relays in FQDN form (bare hostnames stall on
+    /// networks with slow DNS search domains) — no private infra needed
+    /// to exercise the Custom path.
+    #[tokio::test]
+    async fn custom_relay_env_roundtrip() {
+        let _serial = SERIAL.lock().await;
+        let _env = EnvGuard::set(
+            "FLY_RELAY_URL",
+            "https://euc1-1.relay.n0.iroh.link./, https://aps1-1.relay.n0.iroh.link./",
+        );
+        let base = unique_test_dir("customrelay");
+        let src_dir = base.join("src");
+        let out_dir = base.join("out");
+        let cache_dir = base.join("cache");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let content: Vec<u8> = (0..65536u32).map(|i| (i.wrapping_mul(7)) as u8).collect();
+        std::fs::write(src_dir.join("input.bin"), &content).unwrap();
+
+        let (send_tx, _send_rx) = mpsc::unbounded_channel();
+        let started = share::start_share(
+            &src_dir.join("input.bin"),
+            share::TicketType::Full,
+            send_tx,
+        )
+        .await
+        .expect("share");
+        let (recv_tx, _recv_rx) = mpsc::unbounded_channel();
+        let (name, _) = receive(
+            &started.ticket,
+            &out_dir,
+            &cache_dir,
+            recv_tx,
+            Arc::new(ReceiveControl::default()),
+        )
+        .await
+        .expect("receive over the custom relay");
+        assert_eq!(name, "input.bin");
+        assert_eq!(
+            std::fs::read(out_dir.join("input.bin")).unwrap(),
+            content
+        );
+        started.session.shutdown().await;
         std::fs::remove_dir_all(&base).ok();
     }
 

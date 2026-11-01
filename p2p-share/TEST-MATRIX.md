@@ -18,7 +18,7 @@ machines (or VMs) can check. Run it before every tester handoff.
 
 | # | Scenario | Steps | Expected |
 |---|----------|-------|----------|
-| T1 | Two-machine full ticket | Share on PC1, receive on PC2 (different networks ideally) | Bytes match; sender shows Delivered and auto-stops |
+| T1 | Two-machine full ticket | Share on PC1, receive on PC2 (different networks ideally) | Bytes match; sender shows Delivered and auto-stops; both sides show the pipe (Direct/Relayed) next to the speed |
 | T2 | Short (id) ticket | Same with `--ticket-type id` / short ticket | Works; if it fails where a full ticket works, suspect DNS filtering (the error says so) |
 | T3 | Impatient start | Paste ticket, try Start before details load | Start stays disabled until the lookup finishes; no wedge, no restart needed |
 | T4 | Double receive | Receive the same file twice into one folder | Second saves as `name (1).ext`; banner + Open use the real name |
