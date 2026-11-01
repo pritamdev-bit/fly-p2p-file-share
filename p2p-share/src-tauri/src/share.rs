@@ -245,7 +245,11 @@ fn endpoint_builder(port: Option<u16>) -> Result<Builder> {
             std::env::var("FLY_RELAY_URL").ok().as_deref(),
         ))
         .proxy_from_env()
-        .portmapper_config(PortmapperConfig::Disabled);
+        // Automatic UPnP/PCP/NAT-PMP mapping: the app asks the router
+        // itself to open the fixed port, so home routers yield direct
+        // connections with zero user setup. Where the router refuses
+        // (mobile data, CGNAT), the relay stays as the fallback.
+        .portmapper_config(PortmapperConfig::default());
     if let Some(port) = port {
         // Pin both families to the same port. IPv6 is best-effort (a
         // v4-only host must still share); a failed IPv4 bind is handled
@@ -265,8 +269,8 @@ fn endpoint_builder(port: Option<u16>) -> Result<Builder> {
 
 /// Build a fresh endpoint: N0 preset (DNS/Pkarr discovery only,
 /// no DHT/mDNS), default relay map (or `FLY_RELAY_URL` when set), proxy
-/// from environment, no UPnP gateway probing (pre-launch proposal:
-/// disabled), fixed UDP port (or `FLY_PORT` when set).
+/// from environment, automatic UPnP/PCP/NAT-PMP port mapping, fixed UDP
+/// port (or `FLY_PORT` when set).
 ///
 /// A new identity is generated per call, so every share (and every receive)
 /// gets a fresh endpoint ID. That is stricter than the plan's per-launch
