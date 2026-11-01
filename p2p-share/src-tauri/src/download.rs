@@ -56,7 +56,7 @@ const RETRY_LIMIT: u32 = 3;
 /// first store is dropped) — and a task stuck there keeps the receive
 /// lock held, wedging the app until restart. Lookups never wait for a
 /// download (`try_read` + busy error); downloads wait for lookups.
-static STORE_ACCESS: RwLock<()> = RwLock::const_new(());
+pub(crate) static STORE_ACCESS: RwLock<()> = RwLock::const_new(());
 
 /// What a ticket points at, with the connection ready to pull from.
 struct TicketTarget {
@@ -1418,6 +1418,70 @@ mod tests {
             "relay-only dial must classify as relayed"
         );
         endpoint.close().await;
+        started.session.shutdown().await;
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Size enforcement must never eat a live transfer: with a zero
+    /// cap (everything over budget), the grace period still protects
+    /// the running download and it completes normally.
+    #[tokio::test]
+    async fn eviction_spares_running_transfer() {
+        let _serial = SERIAL.lock().await;
+        let base = unique_test_dir("evictlive");
+        let src_dir = base.join("src");
+        let out_dir = base.join("out");
+        let cache_dir = base.join("cache");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let big: Vec<u8> = (0..(32u32 * 1024 * 1024)).map(|i| (i.wrapping_mul(11)) as u8).collect();
+        std::fs::write(src_dir.join("drop.bin"), &big).unwrap();
+        drop(big);
+
+        let (send_tx, _send_rx) = mpsc::unbounded_channel();
+        let started = share::start_share(&src_dir.join("drop.bin"), share::TicketType::Full, send_tx)
+            .await
+            .expect("share");
+        let ticket = started.ticket.clone();
+        let hash_hex = BlobTicket::from_str(&ticket).unwrap().hash().to_hex();
+
+        let cache_clone = cache_dir.clone();
+        let out_clone = out_dir.clone();
+        let ticket_clone = ticket.clone();
+        let (first_tx, mut first_rx) = mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            receive(
+                &ticket_clone,
+                &out_clone,
+                &cache_clone,
+                first_tx,
+                Arc::new(ReceiveControl::default()),
+            )
+            .await
+        });
+        assert!(
+            wait_for_partial(&mut first_rx).await,
+            "never saw a partial progress event"
+        );
+        // Zero cap with the real grace: a live transfer must survive.
+        crate::prune::enforce_cache_cap(
+            &cache_dir,
+            "ticket-",
+            0,
+            crate::prune::CACHE_EVICT_GRACE,
+        );
+        assert!(
+            cache_dir.join(format!("ticket-{hash_hex}")).exists(),
+            "eviction must not delete a running transfer's cache"
+        );
+        let (name, _) = task
+            .await
+            .expect("task must complete")
+            .expect("receive must complete after eviction attempt");
+        assert_eq!(name, "drop.bin");
+        assert_eq!(
+            std::fs::read(out_dir.join("drop.bin")).unwrap().len(),
+            32 * 1024 * 1024
+        );
         started.session.shutdown().await;
         std::fs::remove_dir_all(&base).ok();
     }

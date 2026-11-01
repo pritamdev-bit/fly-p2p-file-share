@@ -257,6 +257,26 @@ export function fetchDiagnostics(): Promise<DiagnosticsInfo> {
   return invoke<DiagnosticsInfo>("get_diagnostics");
 }
 
+export interface CacheInfo {
+  bytes: number;
+  caches: number;
+}
+
+export interface CacheCleared {
+  freedBytes: number;
+  removed: number;
+}
+
+export function fetchCacheInfo(): Promise<CacheInfo> {
+  requireTauri();
+  return invoke<CacheInfo>("get_cache_info");
+}
+
+export function clearCache(): Promise<CacheCleared> {
+  requireTauri();
+  return invoke<CacheCleared>("clear_cache");
+}
+
 export function copyText(text: string): Promise<void> {
   requireTauri();
   return writeText(text);

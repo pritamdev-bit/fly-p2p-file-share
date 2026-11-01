@@ -42,3 +42,4 @@ machines (or VMs) can check. Run it before every tester handoff.
 | U2 | Open / reveal | After a download, Open file + Show in folder | File opens; folder opens with the file selected (executables ask first) |
 | U3 | Diagnostics | Open Diagnostics with relay blocked (VPN/proxy) and unblocked | Relay/NAT rows reflect reality; guidance notes appear for UDP-blocked and relay-unreachable |
 | U4 | Quit guard | Try to quit mid-download | App asks for confirmation; quit anyway stops cleanly |
+| U5 | Cache size + clear | Open Diagnostics after some transfers | Shows total size + folder count; Clear cache empties it and reports freed bytes; refused with guidance while a download runs |

@@ -516,22 +516,25 @@ export default function ReceivePanel({
               </button>
             </div>
             {confirmingOpen && savedName && (
-              <div className="banner banner-warn" role="alertdialog" aria-label="Confirm opening executable file">
-                <AlertIcon size={16} />
-                <div>
-                  <div>
+              <div className="modal-overlay" onClick={() => setConfirmingOpen(false)}>
+                <div
+                  className="card modal-card"
+                  role="alertdialog"
+                  aria-modal="true"
+                  aria-label="Confirm opening executable file"
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  <h2 className="card-title">Open this file?</h2>
+                  <p className="card-sub">
                     {fileNameOf(savedName)} can run programs on this computer.
                     Open it only if you trust the sender.
-                  </div>
-                  <div className="launch-confirm-actions">
-                    <button className="btn-primary btn-small" onClick={handleOpen}>
-                      Open anyway
-                    </button>
-                    <button
-                      className="btn-ghost btn-small"
-                      onClick={() => setConfirmingOpen(false)}
-                    >
+                  </p>
+                  <div className="modal-actions">
+                    <button className="btn-ghost" onClick={() => setConfirmingOpen(false)}>
                       Cancel
+                    </button>
+                    <button className="btn-primary" onClick={handleOpen}>
+                      Open anyway
                     </button>
                   </div>
                 </div>

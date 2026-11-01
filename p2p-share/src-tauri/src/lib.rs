@@ -86,6 +86,8 @@ pub fn run() {
             transfer::open_received,
             transfer::reveal_received,
             transfer::stop_sharing,
+            transfer::get_cache_info,
+            transfer::clear_cache,
             diagnostics::get_diagnostics,
         ])
         .run(tauri::generate_context!())

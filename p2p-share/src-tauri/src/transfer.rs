@@ -102,6 +102,22 @@ pub struct ReceiveInfo {
     pub from_cache: bool,
 }
 
+/// What the UI needs to show download-cache usage.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheInfo {
+    pub bytes: u64,
+    pub caches: u32,
+}
+
+/// What the UI needs after a manual cache clear.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheCleared {
+    pub freed_bytes: u64,
+    pub removed: u32,
+}
+
 #[derive(Default)]
 pub struct AppState {
     /// Sync mutex, deliberately never held across `.await`
@@ -263,8 +279,15 @@ pub async fn receive_file(
         .map_err(|error| format!("cannot locate app data: {error}"))?
         .join("blobs");
     // Best-effort: drop orphaned ticket caches older than the TTL
-    // (crashes/kills leave them behind; cancel deletes its own).
+    // (crashes/kills leave them behind; cancel deletes its own),
+    // then enforce the size cap oldest-first.
     prune::prune_old_dirs(&store_dir, "ticket-", prune::CACHE_TTL);
+    prune::enforce_cache_cap(
+        &store_dir,
+        "ticket-",
+        prune::CACHE_SIZE_CAP,
+        prune::CACHE_EVICT_GRACE,
+    );
     let (events_tx, events_rx) = mpsc::unbounded_channel();
     spawn_forwarder(events_rx, on_event);
     // The download runs as a task so `cancel_receive` can stop it. The
@@ -349,9 +372,58 @@ pub async fn preview_ticket(app: AppHandle, ticket: String) -> Result<download::
         .map_err(|error| format!("cannot locate app data: {error}"))?
         .join("blobs");
     prune::prune_old_dirs(&store_dir, "ticket-", prune::CACHE_TTL);
+    prune::enforce_cache_cap(
+        &store_dir,
+        "ticket-",
+        prune::CACHE_SIZE_CAP,
+        prune::CACHE_EVICT_GRACE,
+    );
     download::preview(&ticket, &store_dir)
         .await
         .map_err(|error| format!("{error:#}"))
+}
+
+/// Download-cache usage for the Diagnostics view. Lock-free on
+/// purpose: sizes may be mid-write fuzzy, but the display must never
+/// block on a transfer.
+#[tauri::command]
+pub fn get_cache_info(app: AppHandle) -> Result<CacheInfo, String> {
+    let store_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("cannot locate app data: {error}"))?
+        .join("blobs");
+    let (bytes, caches) = prune::cache_usage(&store_dir, "ticket-");
+    Ok(CacheInfo { bytes, caches })
+}
+
+/// Delete every ticket cache and report what went away. Refuses while
+/// a download runs (its cache is live); waits for a running lookup
+/// instead of deleting under it. Same lock order as receive_file
+/// (receive lock, then store guard), so no deadlock either way.
+#[tauri::command]
+pub async fn clear_cache(app: AppHandle, state: State<'_, AppState>) -> Result<CacheCleared, String> {
+    let busy = "A download is running; pause or cancel it before clearing the cache.".to_string();
+    let _guard = state.receive_lock.try_lock().map_err(|_| busy.clone())?;
+    if state
+        .receive_control
+        .lock()
+        .map_err(|_| "internal state error".to_string())?
+        .is_some()
+    {
+        return Err(busy);
+    }
+    let _store_guard = download::STORE_ACCESS.write().await;
+    let store_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("cannot locate app data: {error}"))?
+        .join("blobs");
+    let (freed_bytes, removed) = prune::clear_caches(&store_dir, "ticket-");
+    Ok(CacheCleared {
+        freed_bytes,
+        removed,
+    })
 }
 
 /// Offline ticket inspection: parse only, never connects. Lets the UI
