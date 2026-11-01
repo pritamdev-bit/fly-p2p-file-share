@@ -24,6 +24,7 @@ machines (or VMs) can check. Run it before every tester handoff.
 | T4 | Double receive | Receive the same file twice into one folder | Second saves as `name (1).ext`; banner + Open use the real name |
 | T5 | Full disk | Receive a file bigger than free space | Refused **before** downloading, with the needed/available amounts |
 | T6 | Sender death | Kill the sender app mid-transfer | Receiver reports "sender went offline" promptly with progress saved; Resume works when the sender is back |
+| T7 | Fixed port (FLY_PORT) | Sender: set FLY_PORT=7823, forward UDP 7823 on its router, share; receiver on a strict NAT receives | Path shows Direct; without the forward it falls back to Relayed; a taken port warns in the console and the share still works |
 
 ## Interruptions
 
@@ -42,4 +43,4 @@ machines (or VMs) can check. Run it before every tester handoff.
 | U2 | Open / reveal | After a download, Open file + Show in folder | File opens; folder opens with the file selected (executables ask first) |
 | U3 | Diagnostics | Open Diagnostics with relay blocked (VPN/proxy) and unblocked | Relay/NAT rows reflect reality; guidance notes appear for UDP-blocked and relay-unreachable |
 | U4 | Quit guard | Try to quit mid-download | App asks for confirmation; quit anyway stops cleanly |
-| U5 | Cache size + clear | Open Diagnostics after some transfers | Shows total size + folder count; Clear cache empties it and reports freed bytes; refused with guidance while a download runs |
+| U5 | Cache size + clear | Check the sidebar storage row after some transfers | Shows total size + folder count; Clear empties it and reports freed bytes; refused with guidance while a download runs |

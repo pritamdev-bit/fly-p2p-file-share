@@ -8,7 +8,7 @@ use crate::{events::TransferEvent, prune};
 use anyhow::{Context, Result, anyhow, bail};
 use iroh::{
     Endpoint, EndpointAddr, RelayMode, SecretKey, Watcher,
-    endpoint::{Connection, PathEvent, PortmapperConfig, presets},
+    endpoint::{BindOpts, Builder, Connection, PathEvent, PortmapperConfig, presets},
     protocol::{AcceptError, ProtocolHandler, Router},
 };
 use iroh_blobs::{
@@ -24,6 +24,7 @@ use iroh_blobs::{
 use n0_future::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::{
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -204,16 +205,28 @@ fn relay_mode_for(value: Option<&str>) -> RelayMode {
     RelayMode::Custom(iroh::RelayMap::from_iter(urls))
 }
 
-/// Build a fresh ephemeral endpoint: N0 preset (DNS/Pkarr discovery only,
-/// no DHT/mDNS), default relay map (or `FLY_RELAY_URL` when set), proxy
-/// from environment, no UPnP gateway probing (pre-launch proposal:
-/// disabled).
-///
-/// A new identity is generated per call, so every share (and every receive)
-/// gets a fresh endpoint ID. That is stricter than the plan's per-launch
-/// default, and each ticket is independent anyway.
-pub(crate) async fn build_endpoint() -> Result<Endpoint> {
-    Endpoint::builder(presets::N0)
+/// Env override for strict NATs: `FLY_PORT` pins the endpoint's UDP port,
+/// so one router port-forward lets the other side dial straight in
+/// (a symmetric NAT otherwise forces relayed traffic). Unset, blank, or
+/// garbage means an ephemeral port, exactly as before. Forwarding only
+/// matters on the dialed side (the sender); the relay stays as the
+/// automatic fallback either way.
+fn fixed_port_for(value: Option<&str>) -> Option<u16> {
+    let raw = value?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    match raw.parse::<u16>() {
+        Ok(0) | Err(_) => {
+            eprintln!("fly: ignoring unparseable FLY_PORT {raw:?}");
+            None
+        }
+        Ok(port) => Some(port),
+    }
+}
+
+fn endpoint_builder(port: Option<u16>) -> Result<Builder> {
+    let mut builder = Endpoint::builder(presets::N0)
         .secret_key(SecretKey::generate())
         .alpns(vec![
             iroh_blobs::protocol::ALPN.to_vec(),
@@ -223,10 +236,57 @@ pub(crate) async fn build_endpoint() -> Result<Endpoint> {
             std::env::var("FLY_RELAY_URL").ok().as_deref(),
         ))
         .proxy_from_env()
-        .portmapper_config(PortmapperConfig::Disabled)
-        .bind()
-        .await
-        .context("failed to bind P2P endpoint")
+        .portmapper_config(PortmapperConfig::Disabled);
+    if let Some(port) = port {
+        // Pin both families to the same port. IPv6 is best-effort (a
+        // v4-only host must still share); a failed IPv4 bind is handled
+        // by the caller, which falls back to an ephemeral port.
+        builder = builder
+            .bind_addr(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port))
+            .context("bad fixed IPv4 bind address")?;
+        builder = builder
+            .bind_addr_with_opts(
+                SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port),
+                BindOpts::default().set_is_required(false),
+            )
+            .context("bad fixed IPv6 bind address")?;
+    }
+    Ok(builder)
+}
+
+/// Build a fresh ephemeral endpoint: N0 preset (DNS/Pkarr discovery only,
+/// no DHT/mDNS), default relay map (or `FLY_RELAY_URL` when set), proxy
+/// from environment, no UPnP gateway probing (pre-launch proposal:
+/// disabled), ephemeral UDP port (or `FLY_PORT` when set).
+///
+/// A new identity is generated per call, so every share (and every receive)
+/// gets a fresh endpoint ID. That is stricter than the plan's per-launch
+/// default, and each ticket is independent anyway.
+pub(crate) async fn build_endpoint() -> Result<Endpoint> {
+    build_endpoint_with(fixed_port_for(std::env::var("FLY_PORT").ok().as_deref())).await
+}
+
+async fn build_endpoint_with(port: Option<u16>) -> Result<Endpoint> {
+    match endpoint_builder(port)?.bind().await {
+        Ok(endpoint) => {
+            if let Some(port) = port {
+                eprintln!(
+                    "fly: listening on fixed UDP port {port} (forward it for direct connections)"
+                );
+            }
+            Ok(endpoint)
+        }
+        // A taken fixed port must never break a share: warn loudly and
+        // retry with an ephemeral port, exactly the default behavior.
+        Err(err) if port.is_some() => {
+            eprintln!("fly: fixed UDP port unavailable ({err:#}); using a random port");
+            endpoint_builder(None)?
+                .bind()
+                .await
+                .context("failed to bind P2P endpoint")
+        }
+        Err(err) => Err(err).context("failed to bind P2P endpoint"),
+    }
 }
 
 /// Which pipe carries `connection`, from its selected path: "direct"
@@ -537,5 +597,56 @@ mod tests {
             RelayMode::Custom(map) => assert_eq!(map.len(), 2),
             _ => panic!("URL list must select a custom map"),
         }
+    }
+
+    /// Unset/blank means an ephemeral port; a bare number pins it; zero
+    /// and garbage warn and fall back instead of breaking shares.
+    #[test]
+    fn fixed_port_parses() {
+        assert_eq!(fixed_port_for(None), None);
+        assert_eq!(fixed_port_for(Some("")), None);
+        assert_eq!(fixed_port_for(Some("   ")), None);
+        assert_eq!(fixed_port_for(Some("0")), None);
+        assert_eq!(fixed_port_for(Some("abc")), None);
+        assert_eq!(fixed_port_for(Some("99999")), None);
+        assert_eq!(fixed_port_for(Some("-1")), None);
+        assert_eq!(fixed_port_for(Some("7823")), Some(7823));
+        assert_eq!(fixed_port_for(Some("  7823  ")), Some(7823));
+    }
+
+    /// A fixed port that is already taken must never break endpoint
+    /// creation: the builder warns and falls back to an ephemeral port.
+    #[tokio::test]
+    async fn fixed_port_taken_falls_back_to_ephemeral() {
+        let taken = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = taken.local_addr().unwrap().port();
+        let endpoint = build_endpoint_with(Some(port))
+            .await
+            .expect("taken fixed port must fall back to ephemeral");
+        endpoint.close().await;
+        drop(taken);
+    }
+
+    /// A free fixed port is actually held: a second bind of it fails
+    /// while the endpoint lives, so a router forward reaches this app.
+    #[tokio::test]
+    async fn fixed_port_free_binds_and_holds() {
+        let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let endpoint = build_endpoint_with(Some(port))
+            .await
+            .expect("free fixed port must bind");
+        // Probe the wildcard, not loopback: Windows lets a loopback bind
+        // overlap a wildcard one, but two wildcards always conflict.
+        let clash = std::net::UdpSocket::bind(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            port,
+        ));
+        assert!(
+            clash.is_err(),
+            "endpoint must hold the fixed port, not share it"
+        );
+        endpoint.close().await;
     }
 }
