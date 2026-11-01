@@ -385,6 +385,10 @@ button:focus-visible {
   background: var(--panel-strong);
 }
 
+.slip .banner-warn {
+  margin-bottom: 12px;
+}
+
 .ticket-row {
   display: flex;
   gap: 10px;

@@ -73,3 +73,6 @@ agent/
 
 # ── Reference screenshots (5 MB, local only) ──
 app-image-examples/
+
+# Taste skill working files (direction sheets, local inspection output)
+.taste-skill/
