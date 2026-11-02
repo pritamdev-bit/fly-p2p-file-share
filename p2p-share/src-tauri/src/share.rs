@@ -44,10 +44,21 @@ pub(crate) const DONE_ALPN: &[u8] = b"fly/done/0";
 
 /// Filename + size carried inside the hashed collection, so the receiver
 /// learns the real name from the ticket instead of trusting chat text.
+/// `files` is the entry count and `sizes` the per-entry bytes in
+/// collection order; both are new with folders and default for older
+/// tickets (which always carry exactly one file of `size` bytes).
 #[derive(Serialize, Deserialize)]
 pub struct ShareMetadata {
     pub name: String,
     pub size: u64,
+    #[serde(default = "default_file_count")]
+    pub files: u64,
+    #[serde(default)]
+    pub sizes: Vec<u64>,
+}
+
+fn default_file_count() -> u64 {
+    1
 }
 
 /// Which addresses a ticket carries.
@@ -382,7 +393,16 @@ pub async fn start_share(
             .await
             .context("cannot open sender store")?,
     );
-    let tag = import_file(&store, path).await?;
+    // validate_share_path already rejected symlinks, so following the
+    // path here cannot escape into one.
+    let tag = if std::fs::metadata(path)
+        .context("cannot stat share path")?
+        .is_dir()
+    {
+        import_folder(&store, path).await?
+    } else {
+        import_file(&store, path).await?
+    };
     let gate = Arc::new(ConnectionGate {
         semaphore: Semaphore::new(1),
         active: AtomicU32::new(0),
@@ -492,13 +512,13 @@ fn validate_share_path(path: &Path) -> Result<()> {
     let meta = std::fs::symlink_metadata(path)
         .map_err(|_| anyhow!("cannot access '{}': no such file", path.display()))?;
     if meta.file_type().is_symlink() {
-        bail!("sharing symlinks is not supported; pick the real file");
+        bail!("sharing symlinks is not supported; pick the real file or folder");
     }
     if meta.is_dir() {
-        bail!("sharing folders arrives in a later version; pick a single file");
+        return Ok(());
     }
     if !meta.is_file() {
-        bail!("can only share regular files");
+        bail!("can only share regular files and folders");
     }
     Ok(())
 }
@@ -511,19 +531,23 @@ async fn import_file(db: &Store, path: &Path) -> Result<TempTag> {
         .and_then(|name| name.to_str())
         .context("filename must be valid UTF-8")?
         .to_owned();
-    let size = std::fs::metadata(path).context("cannot stat file")?.len();
+    let (file_tag, size) = import_single_blob(db, path).await?;
     let metadata = ShareMetadata {
         name: name.clone(),
         size,
+        files: 1,
+        sizes: vec![size],
     };
-    let metadata_bytes = serde_json::to_vec(&metadata).context("cannot encode metadata")?;
-    let metadata_tag = db
-        .add_bytes(metadata_bytes)
-        .temp_tag()
-        .await
-        .context("cannot store metadata")?;
-    // Copy (not reference): the share must survive the user moving or
-    // deleting the source file while serving.
+    let tag = store_collection(db, &metadata, &[(name, file_tag.hash())]).await?;
+    drop(file_tag);
+    Ok(tag)
+}
+
+/// Copy one file into the store (never reference): the share must survive
+/// the user moving or deleting the source file while serving. Returns the
+/// blob tag plus its byte size.
+async fn import_single_blob(db: &Store, path: &Path) -> Result<(TempTag, u64)> {
+    let size = std::fs::metadata(path).context("cannot stat file")?.len();
     let import = db.add_path_with_opts(AddPathOptions {
         path: path.to_path_buf(),
         mode: ImportMode::Copy,
@@ -542,13 +566,98 @@ async fn import_file(db: &Store, path: &Path) -> Result<TempTag> {
         }
     }
     let file_tag = file_tag.context("import ended without producing a tag")?;
+    Ok((file_tag, size))
+}
+
+/// Store the metadata blob plus `entries` (name + blob hash) as one
+/// collection. Returns the collection tag (which pins everything it
+/// references).
+async fn store_collection(
+    db: &Store,
+    metadata: &ShareMetadata,
+    entries: &[(String, Hash)],
+) -> Result<TempTag> {
+    let metadata_bytes = serde_json::to_vec(&metadata).context("cannot encode metadata")?;
+    let metadata_tag = db
+        .add_bytes(metadata_bytes)
+        .temp_tag()
+        .await
+        .context("cannot store metadata")?;
     let mut collection = Collection::default();
     collection.push(METADATA_NAME.to_owned(), metadata_tag.hash());
-    collection.push(name, file_tag.hash());
+    for (name, hash) in entries {
+        collection.push(name.clone(), *hash);
+    }
     let tag = collection.store(db).await.context("cannot store collection")?;
     drop(metadata_tag);
-    drop(file_tag);
     Ok(tag)
+}
+
+/// List every regular file under `dir` as (relative path, absolute path),
+/// sorted for deterministic tickets. Symlinks are never followed (a
+/// symlink is skipped, a symlinked dir is not descended into); empty
+/// dirs contribute nothing. No new dependency: plain recursion.
+fn walk_files(dir: &Path) -> Result<Vec<(PathBuf, PathBuf)>> {
+    fn visit(dir: &Path, rel: &Path, out: &mut Vec<(PathBuf, PathBuf)>) -> Result<()> {
+        let abs = dir.join(rel);
+        let mut entries: Vec<_> = std::fs::read_dir(&abs)
+            .with_context(|| format!("cannot list '{}'", abs.display()))?
+            .collect::<std::io::Result<_>>()
+            .with_context(|| format!("cannot list '{}'", abs.display()))?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            // file_type never follows symlinks: symlinks are skipped,
+            // never descended into or imported.
+            let file_type = entry
+                .file_type()
+                .with_context(|| format!("cannot stat '{}'", entry.path().display()))?;
+            let child_rel = rel.join(entry.file_name());
+            if file_type.is_dir() {
+                visit(dir, &child_rel, out)?;
+            } else if file_type.is_file() {
+                out.push((child_rel, abs.join(entry.file_name())));
+            }
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    visit(dir, Path::new(""), &mut out)?;
+    Ok(out)
+}
+
+/// Import a folder like [`import_file`], with one collection entry per
+/// file named by its forward-slash relative path. Returns the collection
+/// tag (which pins everything it references).
+async fn import_folder(db: &Store, dir: &Path) -> Result<TempTag> {
+    let name = dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("folder name must be valid UTF-8")?
+        .to_owned();
+    let mut entries = Vec::new();
+    let mut sizes = Vec::new();
+    let mut total: u64 = 0;
+    for (rel, abs) in walk_files(dir)? {
+        let entry_name = rel
+            .to_str()
+            .context("folder names must be valid UTF-8")?
+            .replace('\\', "/");
+        let (file_tag, size) = import_single_blob(db, &abs).await?;
+        entries.push((entry_name, file_tag.hash()));
+        sizes.push(size);
+        total = total.saturating_add(size);
+        drop(file_tag);
+    }
+    if entries.is_empty() {
+        bail!("folder '{}' has no files to share", name);
+    }
+    let metadata = ShareMetadata {
+        name,
+        size: total,
+        files: entries.len() as u64,
+        sizes,
+    };
+    store_collection(db, &metadata, &entries).await
 }
 
 fn unique_temp_dir(prefix: &str) -> Result<PathBuf> {

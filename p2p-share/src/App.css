@@ -344,6 +344,13 @@ button:focus-visible {
   min-width: 0;
 }
 
+.file-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
 .file-name {
   font-size: 15px;
   font-weight: 600;

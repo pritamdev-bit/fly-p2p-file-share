@@ -6,6 +6,7 @@ import {
   fileNameOf,
   onFileDrop,
   pickFile,
+  pickFolder,
   sendFile,
   stopSharing,
 } from "../api";
@@ -134,6 +135,17 @@ export default function SendPanel({
     }
   }
 
+  async function handleChooseFolder() {
+    try {
+      const picked = await pickFolder();
+      if (!picked) return;
+      await sharePath(picked);
+    } catch (err) {
+      setStatus("error");
+      setMessage(err instanceof Error ? err.message : String(err));
+    }
+  }
+
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     onFileDrop(
@@ -205,24 +217,27 @@ export default function SendPanel({
           <FileIcon size={26} />
         </span>
         <div className="file-meta">
-          <div className="file-name">{filePath ? fileNameOf(filePath) : "No file chosen"}</div>
+          <div className="file-name">{filePath ? fileNameOf(filePath) : "No file or folder chosen"}</div>
           <div className="file-sub">
             {filePath ? (
               <span className="pill pill-green">
                 <CheckIcon size={14} /> Selected
               </span>
             ) : (
-              "Pick a file or drop one anywhere in this window."
+              "Pick a file or a folder, or drop either anywhere in this window."
             )}
           </div>
         </div>
-        <button className="btn-primary" onClick={handleChoose} disabled={busy}>
-          {status === "preparing"
-            ? "Preparing…"
-            : filePath
-              ? "Choose another file"
+        <div className="file-actions">
+          <button className="btn-primary" onClick={handleChoose} disabled={busy}>
+            {status === "preparing"
+              ? "Preparing…"
               : "Choose a file"}
-        </button>
+          </button>
+          <button className="btn-ghost" onClick={handleChooseFolder} disabled={busy}>
+            Choose a folder
+          </button>
+        </div>
       </div>
 
       {!busy && (
@@ -254,7 +269,7 @@ export default function SendPanel({
 
       {status === "preparing" && (
         <div className="banner banner-info" role="status">
-          Getting the file ready. This takes a moment for big files.
+          Getting it ready. This takes a moment for big files or folders.
         </div>
       )}
 
@@ -383,7 +398,7 @@ export default function SendPanel({
           <div className="drop-overlay-inner">
             <FileIcon size={30} />
             <div className="drop-overlay-title">Drop to send this file</div>
-            <div className="drop-overlay-sub">One file at a time for now.</div>
+            <div className="drop-overlay-sub">One file or one folder at a time for now.</div>
           </div>
         </div>
       )}

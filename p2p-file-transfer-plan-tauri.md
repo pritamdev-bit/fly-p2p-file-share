@@ -243,7 +243,7 @@ Rust tips:
 ### Phase 5: Optional polish (1-2 weeks, pick what you need)
 
 - [ ] **Relay/discovery hosting — decided before launch:** paid Shared/Dedicated or self-hosted (`RelayMode::Custom`, self-host guide exists). Bandwidth costs for relayed transfers, so consider limits. Either way, document the metadata-visibility tradeoff. (Progress: `FLY_RELAY_URL` support + failover shipped with tests; tradeoff documented in `p2p-share/PRELAUNCH-DECISIONS.md`. Tier choice still pending.)
-- [ ] **Folders:** collections support them with the same libraries; reimplement the pattern from the read-only reference.
+- [x] **Folders:** collections support them with the same libraries. (Shipped: recursive import with relative-path entries, per-file sizes in metadata, multi-blob download with cumulative progress, validated tree export; empty dirs skipped, symlinks skipped. Single-file layout unchanged.)
 - [ ] **Accept/reject on the sender side:** not possible with the simple pull model. This is the main reason to consider approach B.
 - [ ] **Same-network mDNS fast path:** skip public discovery on the LAN. Deliberately off by default (privacy); a later enhancement.
 - [ ] **Nicer tickets:** QR code, session-lifetime option, receiver/rate/size caps as options. (Short numeric codes rejected for v1: they need a rendezvous server mapping codes to tickets, with abuse-control and metadata-privacy costs out of proportion to the convenience.)

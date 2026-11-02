@@ -32,6 +32,7 @@ export type TicketType = "id" | "full";
 export interface FilePreview {
   name: string;
   size: number;
+  files: number;
 }
 
 /** Returned by `inspect_ticket`: offline parse, never connects. */
@@ -79,6 +80,11 @@ function firstPath(selection: string | string[] | null): string | null {
 export async function pickFile(): Promise<string | null> {
   requireTauri();
   return firstPath(await open({ multiple: false, title: "Choose a file to send" }));
+}
+
+export async function pickFolder(): Promise<string | null> {
+  requireTauri();
+  return firstPath(await open({ directory: true, multiple: false, title: "Choose a folder to send" }));
 }
 
 export async function pickSaveDir(): Promise<string | null> {

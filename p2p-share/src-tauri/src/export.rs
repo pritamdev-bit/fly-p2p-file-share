@@ -28,6 +28,36 @@ pub fn validate_single_segment(name: &str) -> Result<()> {
     }
 }
 
+/// A remote-provided folder entry must be a plain relative path: only
+/// normal segments, no `..`, no absolute paths, no prefixes. Depth is
+/// capped so a hostile ticket cannot nest absurdly deep.
+pub fn validate_relative_path(name: &str) -> Result<()> {
+    if name.is_empty() {
+        bail!("sender provided an empty file name");
+    }
+    let mut depth = 0u32;
+    for component in Path::new(name).components() {
+        match component {
+            Component::Normal(_) => depth += 1,
+            _ => bail!("sender provided an unsafe file name"),
+        }
+    }
+    if depth == 0 || depth > 64 {
+        bail!("sender provided an unsafe file name");
+    }
+    Ok(())
+}
+
+/// Sanitize every segment of a validated relative path, so traversal is
+/// rejected (never rewritten) while merely illegal characters are
+/// neutralized per platform. Idempotent like [`sanitize_filename`].
+pub fn sanitize_relative_path(name: &str) -> String {
+    name.split('/')
+        .map(sanitize_filename)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// Windows device names, case-insensitive, with or without an extension
 /// (`NUL.txt` is as reserved as `NUL`). Verified against Microsoft's
 /// "Naming Files, Paths, and Namespaces" (Win32 FileIO docs).
@@ -206,6 +236,105 @@ pub async fn export_file(
     ))
 }
 
+/// Export a whole folder: commit every blob under a fresh top-level dir
+/// (suffixed when the name is taken, like single files). Returns the top
+/// dir path. Structure, not just bytes, is validated: every entry must
+/// be a plain relative path or nothing is written.
+pub async fn export_tree(
+    db: &Store,
+    files: &[(String, Hash)],
+    top_name: &str,
+    output_dir: &Path,
+) -> Result<PathBuf> {
+    validate_single_segment(top_name)?;
+    let safe_top = sanitize_filename(top_name);
+    std::fs::create_dir_all(output_dir).context("cannot create save folder")?;
+    if !output_dir.is_dir() {
+        bail!("save path is not a folder");
+    }
+    cleanup_stale_staging(output_dir);
+    for (rel, _) in files {
+        validate_relative_path(rel)?;
+    }
+    // Claim the top dir first so every file below lands in a dir we own.
+    let mut top: Option<PathBuf> = None;
+    for attempt in 0..100u32 {
+        let candidate = output_dir.join(suffixed_name(&safe_top, attempt));
+        match std::fs::create_dir(&candidate) {
+            Ok(()) => {
+                top = Some(candidate);
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let top = top.context("could not find a free folder name after 100 attempts")?;
+    let staging = staging_dir(output_dir)?;
+    let mut staged = 0u32;
+    let result = export_tree_inner(db, files, &top, &staging, &mut staged).await;
+    cleanup_staging(&staging);
+    result?;
+    Ok(top)
+}
+
+async fn export_tree_inner(
+    db: &Store,
+    files: &[(String, Hash)],
+    top: &Path,
+    staging: &Path,
+    staged: &mut u32,
+) -> Result<()> {
+    for (rel, hash) in files {
+        let safe_rel = sanitize_relative_path(rel);
+        let final_path = top.join(&safe_rel);
+        if let Some(parent) = final_path.parent() {
+            std::fs::create_dir_all(parent).context("cannot create save folder")?;
+        }
+        *staged += 1;
+        let staged_target = staging.join(format!("file-{staged}"));
+        if let Err(error) = export_to_staging(db, *hash, &staged_target).await {
+            let _ = std::fs::remove_dir_all(top);
+            return Err(error);
+        }
+        // The top dir is freshly ours, so a taken name here means a
+        // collision inside one share (duplicate entry); suffix and move
+        // on rather than merging or failing the whole folder.
+        let mut committed = false;
+        for attempt in 0..100u32 {
+            let target = if attempt == 0 {
+                final_path.clone()
+            } else {
+                let file_name = final_path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "file".to_string());
+                let parent = final_path.parent().unwrap_or(top);
+                parent.join(suffixed_name(&file_name, attempt))
+            };
+            if attempt > 0 && std::fs::symlink_metadata(&target).is_ok() {
+                continue;
+            }
+            match move_without_replacing(&staged_target, &target) {
+                Ok(()) => {
+                    committed = true;
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    let _ = std::fs::remove_dir_all(top);
+                    return Err(error.into());
+                }
+            }
+        }
+        if !committed {
+            let _ = std::fs::remove_dir_all(top);
+            bail!("could not find a free file name after 100 attempts");
+        }
+    }
+    Ok(())
+}
+
 /// Atomically move the staged file into place without replacing an existing
 /// target. Every release platform has a native no-replace primitive.
 #[cfg(target_os = "linux")]
@@ -352,6 +481,39 @@ mod tests {
             let once = sanitize_filename(name);
             assert_eq!(sanitize_filename(&once), once, "not idempotent: {name}");
         }
+    }
+
+    #[test]
+    fn rejects_hostile_relative_paths() {
+        assert!(validate_relative_path("f.txt").is_ok());
+        assert!(validate_relative_path("a/b/c.txt").is_ok());
+        assert!(validate_relative_path("..").is_err());
+        assert!(validate_relative_path("../escape.txt").is_err());
+        assert!(validate_relative_path("a/../../escape.txt").is_err());
+        assert!(validate_relative_path("").is_err());
+        assert!(validate_relative_path(&"a/".repeat(65)).is_err());
+        assert!(validate_relative_path(&"a/".repeat(64)).is_ok());
+        #[cfg(windows)]
+        {
+            assert!(validate_relative_path("C:\\Windows\\x.txt").is_err());
+            assert!(validate_relative_path("\\abs.txt").is_err());
+        }
+        #[cfg(unix)]
+        {
+            assert!(validate_relative_path("/abs.txt").is_err());
+        }
+    }
+
+    #[test]
+    fn sanitize_relative_path_neutralizes_segments() {
+        assert_eq!(sanitize_relative_path("a/b:c"), "a/b_c");
+        assert_eq!(sanitize_relative_path("sub/CON/x"), "sub/_CON/x");
+        assert_eq!(sanitize_relative_path("ok/notes. "), "ok/notes");
+        assert_eq!(
+            sanitize_relative_path("ok/notes. "),
+            sanitize_relative_path(&sanitize_relative_path("ok/notes. ")),
+            "must stay idempotent"
+        );
     }
 
     #[test]

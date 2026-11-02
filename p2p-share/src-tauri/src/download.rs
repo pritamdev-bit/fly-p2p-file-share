@@ -7,7 +7,10 @@
 use crate::{
     disk,
     events::TransferEvent,
-    export::{export_file, sanitize_filename, validate_single_segment},
+    export::{
+        export_file, export_tree, sanitize_filename, sanitize_relative_path,
+        validate_relative_path, validate_single_segment,
+    },
     share::{DONE_ALPN, METADATA_NAME, ShareMetadata, build_endpoint},
     transfer::{CancelMode, ReceiveControl},
 };
@@ -58,6 +61,13 @@ const RETRY_LIMIT: u32 = 3;
 /// download (`try_read` + busy error); downloads wait for lookups.
 pub(crate) static STORE_ACCESS: RwLock<()> = RwLock::const_new(());
 
+/// One file inside a share: sanitized relative path, blob hash, bytes.
+struct ShareFile {
+    name: String,
+    hash: Hash,
+    size: u64,
+}
+
 /// What a ticket points at, with the connection ready to pull from.
 struct TicketTarget {
     endpoint: Endpoint,
@@ -68,7 +78,8 @@ struct TicketTarget {
     cache_dir: PathBuf,
     collection: Hash,
     file_name: String,
-    file_hash: Hash,
+    files: Vec<ShareFile>,
+    folder: bool,
     total: u64,
 }
 
@@ -77,6 +88,7 @@ struct TicketTarget {
 pub struct FilePreview {
     pub name: String,
     pub size: u64,
+    pub files: u64,
 }
 
 /// Parse the ticket, connect, and read the hashed file details.
@@ -138,7 +150,7 @@ async fn connect_and_describe(
     )
     .await
     .map_err(|_| anyhow!("Timed out waiting for transfer details."))??;
-    let (file_name, file_hash, total) =
+    let (file_name, files, total, folder) =
         describe_collection(&collection, &store, &remote, &connection).await?;
     Ok(TicketTarget {
         endpoint,
@@ -149,7 +161,8 @@ async fn connect_and_describe(
         cache_dir,
         collection: ticket.hash(),
         file_name,
-        file_hash,
+        files,
+        folder,
         total,
     })
 }
@@ -166,6 +179,7 @@ pub async fn preview(ticket_text: &str, base_dir: &Path) -> Result<FilePreview> 
     let preview = FilePreview {
         name: target.file_name.clone(),
         size: target.total,
+        files: target.files.len() as u64,
     };
     close_endpoint(&target.endpoint).await;
     Ok(preview)
@@ -186,14 +200,21 @@ pub async fn receive(
     let _guard = STORE_ACCESS.write().await;
     let target = connect_and_describe(ticket_text, base_dir, &control).await?;
     // Disk preflight: refuse before downloading anything when the save
-    // folder or the ticket cache cannot hold the transfer.
-    let cached = target
-        .store
-        .remote()
-        .local((target.file_hash, BlobFormat::Raw))
-        .await
-        .map(|info| info.local_bytes())
-        .unwrap_or(0);
+    // folder or the ticket cache cannot hold the transfer. Cached bytes
+    // are summed across every file in the share.
+    let mut cached = 0u64;
+    for file in &target.files {
+        cached = cached.saturating_add(
+            target
+                .store
+                .remote()
+                .local((file.hash, BlobFormat::Raw))
+                .await
+                .map(|info| info.local_bytes())
+                .unwrap_or(0)
+                .min(file.size),
+        );
+    }
     let (need_save, need_cache) = disk::space_needs(target.total, cached);
     disk::ensure_space(
         disk::available_space(save_dir)?,
@@ -229,15 +250,28 @@ pub async fn receive(
             return Err(error);
         }
     };
-    // The export may suffix the name (`file (1).zip`) when the save
-    // folder already has one — the UI and the open/reveal record must
-    // use what was actually created, not the ticket name.
-    let final_path =
-        export_file(&target.store, target.file_hash, &target.file_name, save_dir).await?;
-    let received_name = final_path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| target.file_name.clone());
+    // The export may suffix the name (`file (1).zip`, `pics (1)`) when
+    // the save folder already has one — the UI and the open/reveal
+    // record must use what was actually created, not the ticket name.
+    let received_name = if target.folder {
+        let entries: Vec<(String, Hash)> = target
+            .files
+            .iter()
+            .map(|file| (file.name.clone(), file.hash))
+            .collect();
+        let top = export_tree(&target.store, &entries, &target.file_name, save_dir).await?;
+        top.file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| target.file_name.clone())
+    } else {
+        let file = target.files.first().context("share has no files")?;
+        let final_path =
+            export_file(&target.store, file.hash, &target.file_name, save_dir).await?;
+        final_path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| target.file_name.clone())
+    };
     // Make the store durable before returning: a rapid re-receive opens
     // this same dir again, and must see the complete bitfield. Best
     // effort — if it fails, the next fetch just re-downloads some ranges.
@@ -319,26 +353,29 @@ async fn fetch_collection(
         .context("downloaded data is incomplete")
 }
 
-/// Split the collection into our metadata entry plus the single file entry.
-/// Fetches only the tiny metadata blob; the file blob stays remote.
+/// Split the collection into our metadata entry plus the file entries.
+/// Fetches only the tiny metadata blob; file blobs stay remote. Returns
+/// the display name, the sanitized entries with sizes, and the total.
+/// Single-file shares keep their exact old layout; anything else must
+/// be well-formed folder entries (plain relative paths, sizes known).
 async fn describe_collection(
     collection: &Collection,
     db: &Store,
     remote: &iroh_blobs::api::remote::Remote,
     connection: &Connection,
-) -> Result<(String, Hash, u64)> {
+) -> Result<(String, Vec<ShareFile>, u64, bool)> {
     let mut metadata_hash = None;
-    let mut files = Vec::new();
+    let mut entries = Vec::new();
     for (name, hash) in collection.iter() {
-        if name == METADATA_NAME {
+        if name == METADATA_NAME && metadata_hash.is_none() {
             metadata_hash = Some(*hash);
         } else {
-            files.push((name.clone(), *hash));
+            entries.push((name.clone(), *hash));
         }
     }
     let metadata_hash = metadata_hash.context("ticket is missing file details")?;
-    if files.len() != 1 {
-        bail!("unsupported share: expected exactly one file");
+    if entries.is_empty() {
+        bail!("unsupported share: no files");
     }
     // Bounded like every other network wait: an untimed stall here used
     // to hang receives forever on a tarpitted connection.
@@ -355,14 +392,41 @@ async fn describe_collection(
     let metadata: ShareMetadata =
         serde_json::from_slice(&bytes).context("file details are corrupt")?;
     validate_single_segment(&metadata.name)?;
-    let (entry_name, entry_hash) = files.into_iter().next().expect("checked above");
-    if entry_name != metadata.name {
-        bail!("share contents are inconsistent");
-    }
     // Sanitize once here so preview, export, and the returned name all
     // agree on what will actually be created (a Linux sender can share
     // `CON` or `a:b`, which Windows cannot create as-is).
-    Ok((sanitize_filename(&metadata.name), entry_hash, metadata.size))
+    let display = sanitize_filename(&metadata.name);
+    if entries.len() == 1 && metadata.files == 1 {
+        let (entry_name, entry_hash) = entries.into_iter().next().expect("checked above");
+        if entry_name != metadata.name {
+            bail!("share contents are inconsistent");
+        }
+        let size = metadata.sizes.first().copied().unwrap_or(metadata.size);
+        let file = ShareFile {
+            name: display.clone(),
+            hash: entry_hash,
+            size,
+        };
+        return Ok((display, vec![file], metadata.size, false));
+    }
+    // Folder: sizes must be known per entry (older tickets never carry
+    // more than one entry, so a mismatch means tampering).
+    if metadata.sizes.len() != entries.len() {
+        bail!("share contents are inconsistent");
+    }
+    let mut files = Vec::with_capacity(entries.len());
+    for ((entry_name, entry_hash), size) in entries.into_iter().zip(metadata.sizes) {
+        if entry_name == METADATA_NAME {
+            bail!("share contents are inconsistent");
+        }
+        validate_relative_path(&entry_name)?;
+        files.push(ShareFile {
+            name: sanitize_relative_path(&entry_name),
+            hash: entry_hash,
+            size,
+        });
+    }
+    Ok((display, files, metadata.size, true))
 }
 
 /// The stall message: a dead sender must read as one, not as a
@@ -399,7 +463,7 @@ async fn close_endpoint(endpoint: &Endpoint) {
     }
 }
 
-/// Fetch the file blob with progress, retrying transient failures.
+/// Fetch every file blob with progress, retrying transient failures.
 /// Already-downloaded ranges are reused on retry automatically.
 /// Returns whether every byte was already cached (nothing transferred).
 async fn download_with_retry(
@@ -408,27 +472,41 @@ async fn download_with_retry(
     control: &ReceiveControl,
 ) -> Result<bool> {
     let remote = target.store.remote();
-    let (hash, total) = (target.file_hash, target.total);
+    let total = target.total;
     let mut attempt = 0u32;
-    let mut done = 0u64;
+    // Per-file bytes confirmed, kept across attempts (the cache only
+    // grows, so a finished file is never refetched after a retry).
+    let mut fetched = vec![0u64; target.files.len()];
     let mut from_cache = false;
     let mut active = target.connection.clone();
     loop {
         attempt += 1;
         // Resume accounting: fetch progress counts only bytes downloaded
         // in this request, so re-seed the bar from what's cached at the
-        // start of every attempt. Fresh downloads seed 0.
-        let base = remote
-            .local((hash, BlobFormat::Raw))
-            .await
-            .map(|info| info.local_bytes())
-            .unwrap_or(0)
-            .min(total);
-        if attempt == 1 {
-            from_cache = base == total;
+        // start of every attempt. Fresh downloads seed 0. Files already
+        // complete are skipped outright.
+        let mut pending = Vec::new();
+        for (index, file) in target.files.iter().enumerate() {
+            let local = remote
+                .local((file.hash, BlobFormat::Raw))
+                .await
+                .map(|info| info.local_bytes())
+                .unwrap_or(0)
+                .min(file.size);
+            fetched[index] = fetched[index].max(local);
+            if fetched[index] < file.size {
+                pending.push(index);
+            }
         }
-        done = done.max(base);
+        if attempt == 1 {
+            from_cache = fetched.iter().copied().sum::<u64>() >= total;
+        }
+        let mut done: u64 = fetched.iter().copied().sum::<u64>().min(total);
         let _ = events.send(TransferEvent::Progress { done, total });
+        if pending.is_empty() {
+            let _ = events.send(TransferEvent::Progress { done: total, total });
+            return Ok(from_cache);
+        }
         // Attempt 1 reuses the metadata connection. Later attempts dial
         // fresh: after a network change the old connection is dead, and
         // retrying on it would fail every time. The previous attempt's
@@ -458,64 +536,72 @@ async fn download_with_retry(
         // Report which pipe carries this attempt (and any mid-transfer
         // path upgrade) so the UI can show direct vs relayed live.
         crate::share::watch_connection_path(connection, events.clone());
-        let progress = remote.fetch(connection.clone(), (hash, BlobFormat::Raw));
-        let mut stream = progress.stream();
         let mut failed: Option<anyhow::Error> = None;
-        let mut finished = false;
-        loop {
-            match timeout(IDLE_TIMEOUT, stream.next()).await {
-                Err(_) => {
-                    // Idle timeout: nothing arrived for 120s. A closed
-                    // connection means the sender is gone — say so at
-                    // once instead of burning retries against the dead.
-                    // Otherwise probe: an unreachable sender fails fast
-                    // with the same message, a reachable one retries.
-                    // No diagnosis while WE are stopping: a probe dial
-                    // during endpoint teardown only delays the wind-down
-                    // (and on a loaded machine can stall it past the
-                    // close cap, leaving store files locked).
-                    if !control.was_cancelled()
-                        && (connection.close_reason().is_some()
-                            || probe_sender(&target.endpoint, &target.sender).await.is_err())
-                    {
-                        return Err(sender_offline());
+        let mut finished = true;
+        'files: for index in pending {
+            let file = &target.files[index];
+            let base = fetched[index];
+            let progress = remote.fetch(connection.clone(), (file.hash, BlobFormat::Raw));
+            let mut stream = progress.stream();
+            loop {
+                match timeout(IDLE_TIMEOUT, stream.next()).await {
+                    Err(_) => {
+                        // Idle timeout: nothing arrived for 120s. A closed
+                        // connection means the sender is gone — say so at
+                        // once instead of burning retries against the dead.
+                        // Otherwise probe: an unreachable sender fails fast
+                        // with the same message, a reachable one retries.
+                        // No diagnosis while WE are stopping: a probe dial
+                        // during endpoint teardown only delays the wind-down
+                        // (and on a loaded machine can stall it past the
+                        // close cap, leaving store files locked).
+                        if !control.was_cancelled()
+                            && (connection.close_reason().is_some()
+                                || probe_sender(&target.endpoint, &target.sender).await.is_err())
+                        {
+                            return Err(sender_offline());
+                        }
+                        // Only surfaces after RETRY_LIMIT stalls against a
+                        // sender that is still dialable — a sick network,
+                        // not a dead sender.
+                        failed = Some(anyhow!(
+                            "The transfer stalled: no data arrived after several retries. \
+                             Your progress is saved; Resume to try again."
+                        ));
+                        finished = false;
+                        break 'files;
                     }
-                    // Only surfaces after RETRY_LIMIT stalls against a
-                    // sender that is still dialable — a sick network,
-                    // not a dead sender.
-                    failed = Some(anyhow!(
-                        "The transfer stalled: no data arrived after several retries. \
-                         Your progress is saved; Resume to try again."
-                    ));
-                    break;
-                }
-                Ok(None) => {
-                    failed = Some(anyhow!("download ended unexpectedly"));
-                    break;
-                }
-                Ok(Some(GetProgressItem::Progress(offset))) => {
-                    // Never let the bar move backwards on retooled offsets.
-                    done = done.max(base.saturating_add(offset)).min(total);
-                    let _ = events.send(TransferEvent::Progress { done, total });
-                }
-                Ok(Some(GetProgressItem::Done(_))) => {
-                    finished = true;
-                    break;
-                }
-                Ok(Some(GetProgressItem::Error(cause))) => {
-                    // A dead connection (sender stopped sharing, QUIC gave
-                    // up) plus a failed redial is the sender going away
-                    // mid-transfer — not a transient blip worth retrying.
-                    // Skipped while WE are stopping (see the stall
-                    // branch): the stop already decided the outcome.
-                    if !control.was_cancelled()
-                        && connection.close_reason().is_some()
-                        && probe_sender(&target.endpoint, &target.sender).await.is_err()
-                    {
-                        return Err(sender_offline());
+                    Ok(None) => {
+                        failed = Some(anyhow!("download ended unexpectedly"));
+                        finished = false;
+                        break 'files;
                     }
-                    failed = Some(anyhow!("download failed: {cause}"));
-                    break;
+                    Ok(Some(GetProgressItem::Progress(offset))) => {
+                        // Never let the bar move backwards on retooled offsets.
+                        fetched[index] = base.saturating_add(offset).min(file.size);
+                        done = fetched.iter().copied().sum::<u64>().min(total);
+                        let _ = events.send(TransferEvent::Progress { done, total });
+                    }
+                    Ok(Some(GetProgressItem::Done(_))) => {
+                        fetched[index] = file.size;
+                        break;
+                    }
+                    Ok(Some(GetProgressItem::Error(cause))) => {
+                        // A dead connection (sender stopped sharing, QUIC gave
+                        // up) plus a failed redial is the sender going away
+                        // mid-transfer — not a transient blip worth retrying.
+                        // Skipped while WE are stopping (see the stall
+                        // branch): the stop already decided the outcome.
+                        if !control.was_cancelled()
+                            && connection.close_reason().is_some()
+                            && probe_sender(&target.endpoint, &target.sender).await.is_err()
+                        {
+                            return Err(sender_offline());
+                        }
+                        failed = Some(anyhow!("download failed: {cause}"));
+                        finished = false;
+                        break 'files;
+                    }
                 }
             }
         }
@@ -625,6 +711,52 @@ mod tests {
             }
         }
         assert!(delivered, "sender never received the completion ping");
+        started.session.shutdown().await;
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Folder pipeline in one process: share a nested folder, receive it
+    /// elsewhere, compare every file. Empty dirs travel as nothing.
+    #[tokio::test]
+    async fn share_receive_folder_roundtrip() {
+        let _serial = SERIAL.lock().await;
+        let base = unique_test_dir("folder");
+        let src = base.join("src").join("pics");
+        let out_dir = base.join("out");
+        let cache_dir = base.join("cache");
+        std::fs::create_dir_all(src.join("raw")).unwrap();
+        std::fs::create_dir_all(src.join("empty")).unwrap();
+        std::fs::write(src.join("a.txt"), b"hello folder").unwrap();
+        std::fs::write(src.join("raw").join("b.bin"), vec![7u8; 4096]).unwrap();
+
+        let (send_tx, _send_rx) = mpsc::unbounded_channel();
+        let started = share::start_share(&src, share::TicketType::Full, send_tx)
+            .await
+            .expect("share folder");
+        let (recv_tx, _recv_rx) = mpsc::unbounded_channel();
+        let (name, from_cache) = receive(
+            &started.ticket,
+            &out_dir,
+            &cache_dir,
+            recv_tx,
+            Arc::new(ReceiveControl::default()),
+        )
+        .await
+        .expect("receive folder");
+        assert_eq!(name, "pics");
+        assert!(!from_cache, "fresh receive must transfer bytes");
+        assert_eq!(
+            std::fs::read(out_dir.join("pics").join("a.txt")).unwrap(),
+            b"hello folder"
+        );
+        assert_eq!(
+            std::fs::read(out_dir.join("pics").join("raw").join("b.bin")).unwrap(),
+            vec![7u8; 4096]
+        );
+        assert!(
+            !out_dir.join("pics").join("empty").exists(),
+            "empty dirs are not transferred"
+        );
         started.session.shutdown().await;
         std::fs::remove_dir_all(&base).ok();
     }

@@ -433,7 +433,7 @@ export default function ReceivePanel({
             {preview ? (
               <>
                 <div className="preview-name">{fileNameOf(preview.name)}</div>
-                <div className="preview-sub">{formatBytes(preview.size)}. Read straight from the code.</div>
+                <div className="preview-sub">{formatBytes(preview.size)}{preview.files > 1 ? `, ${preview.files} files` : ""}. Read straight from the code.</div>
               </>
             ) : lookingUp ? (
               <div className="preview-sub">Reading the code…</div>
