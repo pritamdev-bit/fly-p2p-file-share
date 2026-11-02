@@ -82,6 +82,43 @@ impl TicketType {
     }
 }
 
+/// How long a share lives: a download count, a wall-clock expiry, or
+/// both. Defaults preserve the old behavior exactly (one download, no
+/// expiry); the UI offers 1-3 downloads and 15 minutes / 1 hour.
+#[derive(Clone, Copy, Debug)]
+pub struct ShareLimits {
+    /// Stop serving after this many completed downloads (always >= 1).
+    pub max_downloads: u32,
+    /// Stop serving this long after the share started (None = never).
+    /// Fires even mid-download; receivers see the sender go offline.
+    pub expires_after: Option<Duration>,
+}
+
+impl Default for ShareLimits {
+    fn default() -> Self {
+        Self {
+            max_downloads: 1,
+            expires_after: None,
+        }
+    }
+}
+
+/// Parse UI values into limits: downloads between 1 and 99, expiry
+/// seconds with 0 meaning never.
+pub(crate) fn parse_limits(max_downloads: u32, expires_secs: u64) -> Result<ShareLimits> {
+    if max_downloads == 0 || max_downloads > 99 {
+        bail!("downloads must be between 1 and 99");
+    }
+    Ok(ShareLimits {
+        max_downloads,
+        expires_after: if expires_secs == 0 {
+            None
+        } else {
+            Some(Duration::from_secs(expires_secs))
+        },
+    })
+}
+
 /// A live outgoing share. Shutting the router down stops serving (which
 /// invalidates the ticket); dropping the tag releases the blobs for GC.
 pub struct ShareSession {
@@ -89,6 +126,7 @@ pub struct ShareSession {
     _store: Store,
     _tag: TempTag,
     temp_dir: PathBuf,
+    limits: ShareLimits,
 }
 
 impl ShareSession {
@@ -377,6 +415,15 @@ pub async fn start_share(
     ticket_type: TicketType,
     events: mpsc::UnboundedSender<TransferEvent>,
 ) -> Result<StartedShare> {
+    start_share_with_limits(path, ticket_type, ShareLimits::default(), events).await
+}
+
+pub async fn start_share_with_limits(
+    path: &Path,
+    ticket_type: TicketType,
+    limits: ShareLimits,
+    events: mpsc::UnboundedSender<TransferEvent>,
+) -> Result<StartedShare> {
     validate_share_path(path)?;
     // Best-effort: drop orphaned sender workspaces older than the TTL
     // (crashes/kills leave them behind; Stop sharing deletes its own).
@@ -448,6 +495,7 @@ pub async fn start_share(
             _store: store,
             _tag: tag,
             temp_dir,
+            limits,
         },
         ticket,
         fingerprint,
@@ -729,6 +777,21 @@ mod tests {
             RelayMode::Custom(map) => assert_eq!(map.len(), 2),
             _ => panic!("URL list must select a custom map"),
         }
+    }
+
+    /// Download counts run 1-99; expiry seconds with 0 meaning never.
+    /// Garbage fails the share up front instead of silently sharing
+    /// forever.
+    #[test]
+    fn limits_parse_bounds() {
+        assert!(parse_limits(0, 0).is_err());
+        assert!(parse_limits(100, 0).is_err());
+        let one = parse_limits(1, 0).expect("1 download, never");
+        assert_eq!(one.max_downloads, 1);
+        assert!(one.expires_after.is_none());
+        let timed = parse_limits(3, 900).expect("3 downloads, 15 min");
+        assert_eq!(timed.max_downloads, 3);
+        assert_eq!(timed.expires_after, Some(Duration::from_secs(900)));
     }
 
     /// Unset/blank means the default port; a bare number pins it; zero

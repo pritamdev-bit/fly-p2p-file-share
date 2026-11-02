@@ -30,6 +30,10 @@ export default function SendPanel({
 }) {
   const [filePath, setFilePath] = useState<string | null>(null);
   const [ticketType, setTicketType] = useState<TicketType>("id");
+  // Share limits: downloads allowed (1-3) and lifetime (0 = never ends).
+  // Sticky across shares; picked before sharing, enforced by the backend.
+  const [maxDownloads, setMaxDownloads] = useState(1);
+  const [expiresSecs, setExpiresSecs] = useState(0);
   const [share, setShare] = useState<ShareInfo | null>(null);
   const [receivers, setReceivers] = useState(0);
   // "direct" | "relayed" | null. Shown only while a receiver is
@@ -57,6 +61,10 @@ export default function SendPanel({
   statusRef.current = status;
   const ticketTypeRef = useRef(ticketType);
   ticketTypeRef.current = ticketType;
+  const maxDownloadsRef = useRef(maxDownloads);
+  maxDownloadsRef.current = maxDownloads;
+  const expiresSecsRef = useRef(expiresSecs);
+  expiresSecsRef.current = expiresSecs;
   const activeRef = useRef(active);
   activeRef.current = active;
 
@@ -66,8 +74,9 @@ export default function SendPanel({
   }, [status, onBusyChange]);
 
   function handleEvent(event: TransferEvent) {
-    // The sender only ever hears Sending + Delivered + TicketUpdated + Path:
-    // pulls are receiver-driven, so no sender-side progress exists.
+    // The sender only ever hears Sending + Delivered + TicketUpdated +
+    // Path + Expired: pulls are receiver-driven, so no sender-side
+    // progress exists.
     if (event.event === "Sending") {
       setReceivers(event.data.receivers);
     } else if (event.event === "Path") {
@@ -81,6 +90,16 @@ export default function SendPanel({
       setLinkCopied(false);
       setTicketNote("");
       setStatus("delivered");
+    } else if (event.event === "Expired") {
+      // Same cleanup as a manual stop: the backend stopped the share
+      // because the download or time limit ran out.
+      setShare(null);
+      setShowQr(false);
+      setCopied(false);
+      setLinkCopied(false);
+      setTicketNote("");
+      setStatus("stopped");
+      setMessage("The download or time limit ran out, so sharing stopped.");
     } else if (event.event === "TicketUpdated") {
       // The network changed and the backend re-minted the code.
       // Anything copied or sent before is stale. Say so plainly.
@@ -99,7 +118,13 @@ export default function SendPanel({
     setShowQr(false);
     setStatus("preparing");
     try {
-      const info = await sendFile(path, kind, handleEvent);
+      const info = await sendFile(
+        path,
+        kind,
+        maxDownloadsRef.current,
+        expiresSecsRef.current,
+        handleEvent,
+      );
       setShare(info);
       setStatus("sharing");
     } catch (err) {
@@ -267,6 +292,53 @@ export default function SendPanel({
         </div>
       )}
 
+      {!busy && (
+        <div className="ticket-type-row">
+          <span className="ticket-type-label">Downloads allowed</span>
+          <div className="segmented" role="group" aria-label="Downloads allowed">
+            {[1, 2, 3].map((n) => (
+              <button
+                key={n}
+                className={maxDownloads === n ? "segmented-active" : ""}
+                onClick={() => setMaxDownloads(n)}
+                title={`${n} ${n === 1 ? "download" : "downloads"} before the code stops working.`}
+              >
+                {n}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {!busy && (
+        <div className="ticket-type-row">
+          <span className="ticket-type-label">Share ends</span>
+          <div className="segmented" role="group" aria-label="Share ends">
+            {[
+              { label: "Never", secs: 0 },
+              { label: "15 min", secs: 900 },
+              { label: "1 hour", secs: 3600 },
+            ].map((opt) => (
+              <button
+                key={opt.label}
+                className={expiresSecs === opt.secs ? "segmented-active" : ""}
+                onClick={() => setExpiresSecs(opt.secs)}
+                title={
+                  opt.secs === 0
+                    ? "The share runs until you stop it or it is downloaded."
+                    : `The share stops by itself after ${opt.label}.`
+                }
+              >
+                {opt.label}
+              </button>
+            ))}
+          </div>
+          <span className="ticket-type-hint">
+            The share stops by itself when the limit runs out, even mid-download.
+          </span>
+        </div>
+      )}
+
       {status === "preparing" && (
         <div className="banner banner-info" role="status">
           Getting it ready. This takes a moment for big files or folders.
@@ -328,6 +400,12 @@ export default function SendPanel({
                 <div className="port-hint">
                   Listening on UDP port {share.port}. If the other side shows
                   Relayed, forwarding this port on your router can make it Direct.
+                </div>
+              )}
+              {(maxDownloads > 1 || expiresSecs > 0) && (
+                <div className="port-hint">
+                  Stops after {maxDownloads} {maxDownloads === 1 ? "download" : "downloads"}
+                  {expiresSecs > 0 && ` or ${expiresSecs === 900 ? "15 minutes" : "1 hour"}`}.
                 </div>
               )}
               <div className="banner banner-warn">

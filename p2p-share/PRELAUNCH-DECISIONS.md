@@ -6,12 +6,12 @@ marked DECIDED.
 
 | # | Decision | Plan default / proposal | Status |
 |---|---|---|---|
-| 1 | Relay tier | Paid Shared/Dedicated or self-hosted (`RelayMode::Custom`, wired to `FLY_RELAY_URL`). Public n0 relays are dev/test-only (rate-limited, no SLA/privacy). | PROPOSED — support shipped, tier choice pending (see below) |
+| 1 | Relay tier | Paid Shared/Dedicated or self-hosted (`RelayMode::Custom`, wired to `FLY_RELAY_URL`). Public n0 relays are dev/test-only (rate-limited, no SLA/privacy). | DECIDED — stay on the free public relay for v1; revisit with a VPS later (code path already exists, one URL change) |
 | 2 | Updater channel | Ship Tauri updater (signatures mandatory; guard `TAURI_SIGNING_PRIVATE_KEY`) or record an explicit no. Until one exists, version checks point at a download page. | PROPOSED |
 | 3 | Node identity lifetime | Ephemeral key per launch (bounds ticket lifetime, no long-term trackable identity). | PROPOSED |
-| 4 | UPnP/NAT-PMP port mapping | Disabled (rely on hole-punching + relay) — or disclose that the app asks the gateway for a port. | PROPOSED |
+| 4 | UPnP/NAT-PMP port mapping | Disabled (rely on hole-punching + relay) — or disclose that the app asks the gateway for a port. | DECIDED — enabled (`PortmapperConfig::default`); the app maps its fixed port itself, relay stays as fallback |
 | 5 | DHT / mDNS lookup | Off. Use the N0 preset (DNS/Pkarr + ticket-embedded addresses) only; document the choice. | PROPOSED |
-| 6 | Receiver / session caps | Max 1 concurrent receiver in v1; auto-stop serving after first completed download; consider session-lifetime option. | PROPOSED |
+| 6 | Receiver / session caps | Max 1 concurrent receiver in v1; auto-stop serving after first completed download; consider session-lifetime option. | DECIDED — downloads allowed 1-3 with auto-stop at the limit; share expiry Never/15 min/1 h; rate/size caps skipped by design (see plan Phase 5) |
 
 References: plan sections 4, 6, 9 and `../p2p-file-transfer-research.md` (I6, I9, I12, V2, V6, V7, V11, V12, V14).
 

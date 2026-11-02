@@ -124,6 +124,9 @@ pub struct AppState {
     /// Sync mutex, deliberately never held across `.await`
     /// (short critical sections only).
     share: Mutex<ShareSlot>,
+    /// Completed downloads for the active share. Reset on every new
+    /// share; the forwarder stops the session at the download limit.
+    deliveries: Mutex<u32>,
     /// Async mutex: held across the whole download on purpose, so a
     /// second Start click fails fast instead of corrupting the cache.
     receive_lock: tokio::sync::Mutex<()>,
@@ -178,18 +181,58 @@ async fn autostop_on_delivered(state: &AppState) {
 /// Sender-side forwarder: on Delivered it stops the session BEFORE
 /// telling the UI, so the moment the UI hears "delivered" the slot is
 /// free and re-sharing works.
+/// Record one completed download; true when the share has served its
+/// download limit and must stop. A poisoned lock stops (safe direction).
+fn note_delivery(state: &AppState, max_downloads: u32) -> bool {
+    match state.deliveries.lock() {
+        Ok(mut count) => {
+            *count = count.saturating_add(1);
+            *count >= max_downloads
+        }
+        Err(_) => true,
+    }
+}
+
+/// Sleep `after`, then stop whatever share is active. One task per share,
+/// run inside the forwarder; a manual/auto stop drops the event senders
+/// and the forwarder — timer included — exits first, so a stale timer can
+/// never kill a later share.
+async fn expire_share_after(state: &AppState, after: Duration) {
+    tokio::time::sleep(after).await;
+    autostop_on_delivered(state).await;
+}
+
 fn spawn_share_forwarder(
     app: AppHandle,
     mut events: mpsc::UnboundedReceiver<TransferEvent>,
     channel: Channel<TransferEvent>,
+    limits: share::ShareLimits,
 ) {
     tauri::async_runtime::spawn(async move {
-        while let Some(event) = events.recv().await {
-            if matches!(event, TransferEvent::Delivered) {
-                autostop_on_delivered(app.state::<AppState>().inner()).await;
+        let expiry = async {
+            match limits.expires_after {
+                Some(after) => expire_share_after(app.state::<AppState>().inner(), after).await,
+                None => std::future::pending::<()>().await,
             }
-            if channel.send(event).is_err() {
-                break;
+        };
+        tokio::pin!(expiry);
+        loop {
+            tokio::select! {
+                event = events.recv() => {
+                    let Some(event) = event else { break };
+                    if matches!(event, TransferEvent::Delivered)
+                        && note_delivery(app.state::<AppState>().inner(), limits.max_downloads)
+                    {
+                        autostop_on_delivered(app.state::<AppState>().inner()).await;
+                    }
+                    if channel.send(event).is_err() {
+                        break;
+                    }
+                }
+                _ = &mut expiry, if limits.expires_after.is_some() => {
+                    let _ = channel.send(TransferEvent::Expired);
+                    break;
+                }
             }
         }
     });
@@ -204,9 +247,13 @@ pub async fn send_file(
     app: AppHandle,
     path: String,
     ticket_type: String,
+    max_downloads: u32,
+    expires_secs: u64,
     on_event: Channel<TransferEvent>,
 ) -> Result<ShareInfo, String> {
     let ticket_type = TicketType::parse(&ticket_type).map_err(|error| error.to_string())?;
+    let limits = share::parse_limits(max_downloads, expires_secs)
+        .map_err(|error| error.to_string())?;
     let state = app.state::<AppState>();
     {
         let mut slot = lock_share(&state)?;
@@ -221,8 +268,9 @@ pub async fn send_file(
         }
     }
     let (events_tx, events_rx) = mpsc::unbounded_channel();
-    spawn_share_forwarder(app.clone(), events_rx, on_event);
-    let started = share::start_share(Path::new(&path), ticket_type, events_tx).await;
+    spawn_share_forwarder(app.clone(), events_rx, on_event, limits);
+    let started =
+        share::start_share_with_limits(Path::new(&path), ticket_type, limits, events_tx).await;
     // Decide under the lock; act after it. The sync guard must never be
     // held across an `.await` (it is not `Send`).
     enum PostStart {
@@ -238,6 +286,10 @@ pub async fn send_file(
                     *slot = ShareSlot::Empty;
                     PostStart::Cancelled(started.session)
                 } else {
+                    *state
+                        .deliveries
+                        .lock()
+                        .map_err(|_| "internal state error".to_string())? = 0;
                     let info = ShareInfo {
                         ticket: started.ticket,
                         fingerprint: started.fingerprint,
@@ -578,6 +630,117 @@ mod tests {
         )
         .await;
         assert!(retry.is_err(), "ticket must be invalid after auto-stop");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Delivery counting: only the max-th download stops the share.
+    #[test]
+    fn deliveries_stop_at_max() {
+        let state = AppState::default();
+        assert!(!note_delivery(&state, 2), "first of two must keep sharing");
+        assert!(note_delivery(&state, 2), "second of two must stop");
+    }
+
+    /// A share with a download limit of two serves twice, then dies:
+    /// two sequential receives succeed, the third fails.
+    #[tokio::test]
+    async fn second_download_stops_share_at_two() {
+        let _serial = crate::TEST_SERIAL.lock().await;
+        let base = unique_test_dir("maxtwo");
+        let src_dir = base.join("src");
+        let out_dir = base.join("out");
+        let out2_dir = base.join("out2");
+        let out3_dir = base.join("out3");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(src_dir.join("input.bin"), vec![9u8; 65536]).unwrap();
+
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let started = share::start_share_with_limits(
+            &src_dir.join("input.bin"),
+            share::TicketType::Full,
+            share::ShareLimits {
+                max_downloads: 2,
+                expires_after: None,
+            },
+            events_tx,
+        )
+        .await
+        .expect("share");
+        let state = AppState::default();
+        *state.share.lock().unwrap() = ShareSlot::Active(started.session);
+
+        for (n, out) in [&out_dir, &out2_dir].iter().enumerate() {
+            let cache = base.join(format!("cache{n}"));
+            let (recv_tx, _recv_rx) = mpsc::unbounded_channel();
+            let (name, _) = download::receive(
+                &started.ticket,
+                out,
+                &cache,
+                recv_tx,
+                Arc::new(ReceiveControl::default()),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("receive {} must succeed", n + 1));
+            assert_eq!(name, "input.bin");
+            // Drain sender events until Delivered, as the forwarder would.
+            let mut delivered = false;
+            while let Ok(Some(event)) =
+                tokio::time::timeout(Duration::from_secs(15), events_rx.recv()).await
+            {
+                if matches!(event, TransferEvent::Delivered) {
+                    delivered = true;
+                    break;
+                }
+            }
+            assert!(delivered, "sender never heard completion ping {}", n + 1);
+            // The forwarder's Delivered branch: count, stop only at max.
+            if note_delivery(&state, 2) {
+                autostop_on_delivered(&state).await;
+            }
+        }
+        assert!(
+            matches!(*state.share.lock().unwrap(), ShareSlot::Empty),
+            "slot must be free after the second download"
+        );
+        // The ticket is dead: a third receive fails instead of serving.
+        let (recv3_tx, _recv3_rx) = mpsc::unbounded_channel();
+        let retry = download::receive(
+            &started.ticket,
+            &out3_dir,
+            &base.join("cache3"),
+            recv3_tx,
+            Arc::new(ReceiveControl::default()),
+        )
+        .await;
+        assert!(retry.is_err(), "ticket must be invalid after two downloads");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Expiry stops an idle share: the slot frees up without any download.
+    #[tokio::test]
+    async fn expiry_stops_an_idle_share() {
+        let _serial = crate::TEST_SERIAL.lock().await;
+        let base = unique_test_dir("expiry");
+        let src_dir = base.join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(src_dir.join("input.bin"), vec![9u8; 1024]).unwrap();
+
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        let started = share::start_share(
+            &src_dir.join("input.bin"),
+            share::TicketType::Full,
+            events_tx,
+        )
+        .await
+        .expect("share");
+        let state = AppState::default();
+        *state.share.lock().unwrap() = ShareSlot::Active(started.session);
+
+        expire_share_after(&state, Duration::from_millis(50)).await;
+        assert!(
+            matches!(*state.share.lock().unwrap(), ShareSlot::Empty),
+            "slot must be free after expiry"
+        );
         std::fs::remove_dir_all(&base).ok();
     }
 }

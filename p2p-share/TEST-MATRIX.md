@@ -26,6 +26,7 @@ machines (or VMs) can check. Run it before every tester handoff.
 | T6 | Sender death | Kill the sender app mid-transfer | Receiver reports "sender went offline" promptly with progress saved; Resume works when the sender is back |
 | T7 | Fixed port + auto mapping | Sender shares (fly listens on UDP 7823, shown on the slip); receiver on a strict NAT receives | If the sender's router allows UPnP, path shows Direct with no setup; otherwise forward UDP 7823 manually, or it falls back to Relayed |
 | T8 | Folder share | Share a folder with nested files and an empty dir; receive on the other machine | Tree recreated with identical bytes; empty dirs skipped; preview shows the file count |
+| T9 | Share limits | Share with downloads allowed 2, then receive twice from two folders | Both succeed; a third receive fails (ticket dead). Expiry is covered by automated tests; a 15-minute manual wait is not required |
 
 ## Interruptions
 

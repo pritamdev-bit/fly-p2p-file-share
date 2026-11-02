@@ -246,7 +246,7 @@ Rust tips:
 - [x] **Folders:** collections support them with the same libraries. (Shipped: recursive import with relative-path entries, per-file sizes in metadata, multi-blob download with cumulative progress, validated tree export; empty dirs skipped, symlinks skipped. Single-file layout unchanged.)
 - [ ] **Accept/reject on the sender side:** not possible with the simple pull model. This is the main reason to consider approach B.
 - [ ] **Same-network mDNS fast path:** skip public discovery on the LAN. Deliberately off by default (privacy); a later enhancement.
-- [ ] **Nicer tickets:** QR code, session-lifetime option, receiver/rate/size caps as options. (Short numeric codes rejected for v1: they need a rendezvous server mapping codes to tickets, with abuse-control and metadata-privacy costs out of proportion to the convenience.)
+- [x] **Nicer tickets:** QR code, session-lifetime option, receiver/rate/size caps as options. (Shipped: QR codes; share expiry Never/15 min/1 h; downloads allowed 1-3 with auto-stop; rate/size caps skipped by design — QUIC congestion control already fair-shares bandwidth and no honest per-stream throttle primitive exists, and a sender-side size cap has no requesting use case. Short numeric codes rejected for v1: they need a rendezvous server mapping codes to tickets, with abuse-control and metadata-privacy costs out of proportion to the convenience.)
 - [ ] **Sigstore + SBOM** on GitHub releases, if not done in Phase 6.
 
 ### Phase 6: Package and ship (about 1 week)

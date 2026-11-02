@@ -15,7 +15,8 @@ export type TransferEvent =
   | { event: "Finished" }
   | { event: "Delivered" }
   | { event: "TicketUpdated"; data: { ticket: string } }
-  | { event: "Path"; data: { path: string } };
+  | { event: "Path"; data: { path: string } }
+  | { event: "Expired" };
 
 /** Returned by `send_file`: what the UI needs once a share starts. */
 export interface ShareInfo {
@@ -138,12 +139,20 @@ export function decodeQrTicket(path: string): Promise<string> {
 export function sendFile(
   path: string,
   ticketType: TicketType,
+  maxDownloads: number,
+  expiresSecs: number,
   onMessage: (event: TransferEvent) => void,
 ): Promise<ShareInfo> {
   requireTauri();
   const onEvent = new Channel<TransferEvent>();
   onEvent.onmessage = onMessage;
-  return invoke<ShareInfo>("send_file", { path, ticketType, onEvent });
+  return invoke<ShareInfo>("send_file", {
+    path,
+    ticketType,
+    maxDownloads,
+    expiresSecs,
+    onEvent,
+  });
 }
 
 export function previewTicket(ticket: string): Promise<FilePreview> {

@@ -26,6 +26,10 @@ pub enum TransferEvent {
     /// selected path changes mid-transfer (hole-punching can upgrade a
     /// relayed start to direct). Both sides emit their own view.
     Path { path: String },
+    /// Sender-side only: the share hit its download count or time limit
+    /// and stopped itself. The ticket is dead; the UI reports it like a
+    /// manual stop with an expiry note.
+    Expired,
     // Failures travel as command `Err` strings, not events. Phase 4 may add:
     // WaitingForReceiver, fingerprint + diagnostics payloads.
 }
