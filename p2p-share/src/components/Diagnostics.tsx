@@ -69,6 +69,14 @@ export default function Diagnostics({ open, onClose }: Props) {
               <span>NAT type</span>
               <code>{info.natType}</code>
             </div>
+            <div className="diag-row">
+              <span>Relay in use</span>
+              <code>
+                {info.homeRelay
+                  ? new URL(info.homeRelay).hostname.replace(/\.$/, "")
+                  : "Not connected"}
+              </code>
+            </div>
           </div>
         )}
         {info && info.natType === "UDP blocked" && (

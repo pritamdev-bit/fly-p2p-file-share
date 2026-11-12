@@ -12,6 +12,10 @@ pub struct DiagnosticsInfo {
     pub node_id: String,
     pub relay_reachable: bool,
     pub nat_type: String,
+    /// Which relay this device homed to: the same latency-driven pick
+    /// the sender and receiver endpoints make. None when no relay
+    /// connected in time.
+    pub home_relay: Option<String>,
 }
 
 const ONLINE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -36,12 +40,50 @@ pub async fn get_diagnostics() -> Result<DiagnosticsInfo, String> {
         Ok(report) => classify_nat(&report),
         Err(_) => "Unknown".to_string(),
     };
+    let home_relay = current_home_relay(&endpoint).await;
     endpoint.close().await;
     Ok(DiagnosticsInfo {
         node_id,
         relay_reachable,
         nat_type,
+        home_relay,
     })
+}
+
+/// Which relay this device homed to (the same latency-driven pick the
+/// sender and receiver endpoints make). online() already guarantees a
+/// connected entry exists; the short poll covers the tick it takes the
+/// watcher to replay it.
+async fn current_home_relay(endpoint: &iroh::Endpoint) -> Option<String> {
+    let mut watcher = endpoint.home_relay_status();
+    for _ in 0..50 {
+        if let Some(status) = watcher.get().into_iter().find(|s| s.is_connected()) {
+            return Some(status.url().to_string());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The home relay read reports a real relay URL once the endpoint
+    /// is online: this is the row the UI shows, so it must resolve.
+    #[tokio::test]
+    async fn home_relay_resolves_when_online() {
+        let endpoint = build_endpoint().await.expect("bind diagnostics endpoint");
+        let online = tokio::time::timeout(ONLINE_TIMEOUT, endpoint.online()).await;
+        assert!(online.is_ok(), "a relay must be reachable");
+        let home = current_home_relay(&endpoint).await;
+        endpoint.close().await;
+        let url = home.expect("a connected home relay must be reported");
+        assert!(
+            url.starts_with("https://"),
+            "relay URL must be absolute, got {url}"
+        );
+    }
 }
 
 /// Human NAT summary from a net report. There is no direct "NAT type"

@@ -50,6 +50,7 @@ export interface DiagnosticsInfo {
   nodeId: string;
   relayReachable: boolean;
   natType: string;
+  homeRelay: string | null;
 }
 
 /** True when running inside the Tauri webview (backend bridge present). */
