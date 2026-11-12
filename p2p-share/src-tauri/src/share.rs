@@ -126,7 +126,6 @@ pub struct ShareSession {
     _store: Store,
     _tag: TempTag,
     temp_dir: PathBuf,
-    limits: ShareLimits,
 }
 
 impl ShareSession {
@@ -225,9 +224,29 @@ impl ProtocolHandler for DoneHandler {
     }
 }
 
+/// fly's own relay: nearby users home to it automatically (home relay
+/// selection is latency-driven), so relayed traffic stays on a fast
+/// box instead of the throttled public one.
+pub(crate) const FLY_RELAY_URL: &str = "https://relay.pritam.codes";
+
+/// Ours plus n0's public relays as fallback: if our relay is down,
+/// relayed traffic degrades instead of failing. Home relay selection
+/// is latency-driven at runtime, so nearby users get ours.
+fn default_relay_map() -> iroh::RelayMap {
+    let mut urls: Vec<iroh::RelayUrl> = vec![
+        FLY_RELAY_URL
+            .parse()
+            .expect("built-in relay URL must parse"),
+    ];
+    let fallbacks: Vec<iroh::RelayUrl> = iroh::defaults::prod::default_relay_map().urls();
+    urls.extend(fallbacks);
+    eprintln!("fly: using default relays (ours plus n0 fallback)");
+    iroh::RelayMap::from_iter(urls)
+}
+
 /// Env override for self-hosters: `FLY_RELAY_URL` holds one relay URL
-/// (or several, comma-separated) that endpoints home to instead of
-/// n0's public relays. Empty or unset means the default map;
+/// (or several, comma-separated) that endpoints home to instead of the
+/// default map. Empty or unset means the default map;
 /// unparseable entries warn and are skipped. This covers relayed
 /// traffic only — short-ticket discovery still uses the N0 preset's
 /// DNS/Pkarr. Sender and receiver should use the same relay set.
@@ -248,7 +267,7 @@ fn relay_mode_for(value: Option<&str>) -> RelayMode {
         }
     }
     if urls.is_empty() {
-        return RelayMode::Default;
+        return RelayMode::Custom(default_relay_map());
     }
     eprintln!("fly: using custom relays {urls:?}");
     RelayMode::Custom(iroh::RelayMap::from_iter(urls))
@@ -415,15 +434,6 @@ pub async fn start_share(
     ticket_type: TicketType,
     events: mpsc::UnboundedSender<TransferEvent>,
 ) -> Result<StartedShare> {
-    start_share_with_limits(path, ticket_type, ShareLimits::default(), events).await
-}
-
-pub async fn start_share_with_limits(
-    path: &Path,
-    ticket_type: TicketType,
-    limits: ShareLimits,
-    events: mpsc::UnboundedSender<TransferEvent>,
-) -> Result<StartedShare> {
     validate_share_path(path)?;
     // Best-effort: drop orphaned sender workspaces older than the TTL
     // (crashes/kills leave them behind; Stop sharing deletes its own).
@@ -495,7 +505,6 @@ pub async fn start_share_with_limits(
             _store: store,
             _tag: tag,
             temp_dir,
-            limits,
         },
         ticket,
         fingerprint,
@@ -753,18 +762,33 @@ mod tests {
     /// Unset/blank means n0's default relays; a URL means a custom
     /// single-relay map; garbage warns and falls back instead of
     /// breaking endpoint creation.
+    /// The default map: our relay first, then n0's public relays as
+    /// fallback. Explicit URLs replace it entirely (no fallback mixed
+    /// in); unset, blank, or all-garbage falls back to it.
+    fn assert_default_map(mode: RelayMode) {
+        match mode {
+            RelayMode::Custom(map) => {
+                let urls = map.urls::<Vec<iroh::RelayUrl>>();
+                // Ours plus the four n0 relays; home selection is
+                // latency-driven at runtime, so map order is irrelevant.
+                assert_eq!(map.len(), 5, "ours plus the four n0 relays");
+                assert!(
+                    urls.contains(
+                        &"https://relay.pritam.codes".parse().unwrap()
+                    ),
+                    "default map must contain our relay"
+                );
+            }
+            _ => panic!("expected the default ours-plus-n0 map"),
+        }
+    }
+
     #[test]
     fn relay_env_selects_map() {
-        assert!(matches!(relay_mode_for(None), RelayMode::Default));
-        assert!(matches!(relay_mode_for(Some("")), RelayMode::Default));
-        assert!(matches!(
-            relay_mode_for(Some("   ")),
-            RelayMode::Default
-        ));
-        assert!(matches!(
-            relay_mode_for(Some("not a url at all !!!")),
-            RelayMode::Default
-        ));
+        assert_default_map(relay_mode_for(None));
+        assert_default_map(relay_mode_for(Some("")));
+        assert_default_map(relay_mode_for(Some("   ")));
+        assert_default_map(relay_mode_for(Some("not a url at all !!!")));
         match relay_mode_for(Some("https://relay.example.com")) {
             RelayMode::Custom(map) => assert_eq!(map.len(), 1),
             _ => panic!("URL must select a custom map"),

@@ -27,6 +27,7 @@ machines (or VMs) can check. Run it before every tester handoff.
 | T7 | Fixed port + auto mapping | Sender shares (fly listens on UDP 7823, shown on the slip); receiver on a strict NAT receives | If the sender's router allows UPnP, path shows Direct with no setup; otherwise forward UDP 7823 manually, or it falls back to Relayed |
 | T8 | Folder share | Share a folder with nested files and an empty dir; receive on the other machine | Tree recreated with identical bytes; empty dirs skipped; preview shows the file count |
 | T9 | Share limits | Share with downloads allowed 2, then receive twice from two folders | Both succeed; a third receive fails (ticket dead). Expiry is covered by automated tests; a 15-minute manual wait is not required |
+| T10 | Own relay | With a friend on a strict NAT, share and receive a file | Transfer completes; path shows Direct where possible, else Relayed through our relay (faster than the public one); if our relay is down it falls back to a public relay |
 
 ## Interruptions
 

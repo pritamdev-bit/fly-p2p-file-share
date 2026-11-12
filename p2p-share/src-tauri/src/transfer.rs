@@ -269,8 +269,7 @@ pub async fn send_file(
     }
     let (events_tx, events_rx) = mpsc::unbounded_channel();
     spawn_share_forwarder(app.clone(), events_rx, on_event, limits);
-    let started =
-        share::start_share_with_limits(Path::new(&path), ticket_type, limits, events_tx).await;
+    let started = share::start_share(Path::new(&path), ticket_type, events_tx).await;
     // Decide under the lock; act after it. The sync guard must never be
     // held across an `.await` (it is not `Send`).
     enum PostStart {
@@ -641,8 +640,9 @@ mod tests {
         assert!(note_delivery(&state, 2), "second of two must stop");
     }
 
-    /// A share with a download limit of two serves twice, then dies:
-    /// two sequential receives succeed, the third fails.
+    /// Counting with a limit of two serves twice, then dies: two
+    /// sequential receives succeed, the third fails. Mirrors the
+    /// forwarder's Delivered branch exactly.
     #[tokio::test]
     async fn second_download_stops_share_at_two() {
         let _serial = crate::TEST_SERIAL.lock().await;
@@ -655,13 +655,9 @@ mod tests {
         std::fs::write(src_dir.join("input.bin"), vec![9u8; 65536]).unwrap();
 
         let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-        let started = share::start_share_with_limits(
+        let started = share::start_share(
             &src_dir.join("input.bin"),
             share::TicketType::Full,
-            share::ShareLimits {
-                max_downloads: 2,
-                expires_after: None,
-            },
             events_tx,
         )
         .await
