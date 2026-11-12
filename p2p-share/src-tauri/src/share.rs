@@ -232,15 +232,19 @@ pub(crate) const FLY_RELAY_URL: &str = "https://relay.pritam.codes";
 /// Ours plus n0's public relays as fallback: if our relay is down,
 /// relayed traffic degrades instead of failing. Home relay selection
 /// is latency-driven at runtime, so nearby users get ours.
+///
+/// TEMP-TEST ONLY (revert after the ours-only experiment): the n0
+/// fallback is commented out so a Relayed transfer proves our relay
+/// works instead of silently using n0.
 fn default_relay_map() -> iroh::RelayMap {
-    let mut urls: Vec<iroh::RelayUrl> = vec![
+    let urls: Vec<iroh::RelayUrl> = vec![
         FLY_RELAY_URL
             .parse()
             .expect("built-in relay URL must parse"),
     ];
-    let fallbacks: Vec<iroh::RelayUrl> = iroh::defaults::prod::default_relay_map().urls();
-    urls.extend(fallbacks);
-    eprintln!("fly: using default relays (ours plus n0 fallback)");
+    // let fallbacks: Vec<iroh::RelayUrl> = iroh::defaults::prod::default_relay_map().urls();
+    // urls.extend(fallbacks);
+    eprintln!("fly: TEMP TEST — ours-only relay, n0 fallback disabled");
     iroh::RelayMap::from_iter(urls)
 }
 
@@ -252,7 +256,7 @@ fn default_relay_map() -> iroh::RelayMap {
 /// DNS/Pkarr. Sender and receiver should use the same relay set.
 /// Prefer FQDN form (`https://relay.example.com./`): bare hostnames
 /// stall on networks with slow DNS search domains.
-fn relay_mode_for(value: Option<&str>) -> RelayMode {
+fn relay_urls_for(value: Option<&str>) -> Vec<iroh::RelayUrl> {
     let mut urls = Vec::new();
     if let Some(value) = value {
         for part in value.split(',') {
@@ -266,6 +270,23 @@ fn relay_mode_for(value: Option<&str>) -> RelayMode {
             }
         }
     }
+    urls
+}
+
+/// The relay map endpoints actually home to: explicit `FLY_RELAY_URL`
+/// or the default (ours plus n0 fallback). Single source for the
+/// endpoint builder and for diagnostics' speed list.
+pub(crate) fn configured_relay_map() -> iroh::RelayMap {
+    let urls = relay_urls_for(std::env::var("FLY_RELAY_URL").ok().as_deref());
+    if urls.is_empty() {
+        default_relay_map()
+    } else {
+        iroh::RelayMap::from_iter(urls)
+    }
+}
+
+fn relay_mode_for(value: Option<&str>) -> RelayMode {
+    let urls = relay_urls_for(value);
     if urls.is_empty() {
         return RelayMode::Custom(default_relay_map());
     }
@@ -762,16 +783,16 @@ mod tests {
     /// Unset/blank means n0's default relays; a URL means a custom
     /// single-relay map; garbage warns and falls back instead of
     /// breaking endpoint creation.
-    /// The default map: our relay first, then n0's public relays as
-    /// fallback. Explicit URLs replace it entirely (no fallback mixed
-    /// in); unset, blank, or all-garbage falls back to it.
+    /// TEMP-TEST ONLY (revert after the ours-only experiment): the
+    /// default map holds our relay alone. Explicit URLs replace it
+    /// entirely; unset, blank, or all-garbage falls back to it.
     fn assert_default_map(mode: RelayMode) {
         match mode {
             RelayMode::Custom(map) => {
                 let urls = map.urls::<Vec<iroh::RelayUrl>>();
-                // Ours plus the four n0 relays; home selection is
+                // Ours alone for the experiment; home selection is
                 // latency-driven at runtime, so map order is irrelevant.
-                assert_eq!(map.len(), 5, "ours plus the four n0 relays");
+                assert_eq!(map.len(), 1, "ours only while n0 is commented out");
                 assert!(
                     urls.contains(
                         &"https://relay.pritam.codes".parse().unwrap()

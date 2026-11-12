@@ -77,6 +77,31 @@ export default function Diagnostics({ open, onClose }: Props) {
                   : "Not connected"}
               </code>
             </div>
+            {info.relays.length > 0 && (
+              <div className="diag-speed">
+                {info.relays.map((relay) => {
+                  let host = relay.url;
+                  try {
+                    host = new URL(relay.url).hostname.replace(/\.$/, "");
+                  } catch {
+                    // Keep the raw URL when it does not parse.
+                  }
+                  return (
+                    <div className="diag-row" key={relay.url}>
+                      <span>
+                        {host}
+                        {relay.preferred ? " · preferred" : ""}
+                      </span>
+                      <code>
+                        {relay.latencyMs == null
+                          ? "no answer"
+                          : `${relay.latencyMs} ms`}
+                      </code>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
           </div>
         )}
         {info && info.natType === "UDP blocked" && (

@@ -46,11 +46,18 @@ export interface TicketInfo {
 }
 
 /** Returned by `get_diagnostics`. Never contains tickets or paths. */
+export interface RelayProbe {
+  url: string;
+  latencyMs: number | null;
+  preferred: boolean;
+}
+
 export interface DiagnosticsInfo {
   nodeId: string;
   relayReachable: boolean;
   natType: string;
   homeRelay: string | null;
+  relays: RelayProbe[];
 }
 
 /** True when running inside the Tauri webview (backend bridge present). */
