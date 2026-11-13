@@ -228,24 +228,82 @@ impl ProtocolHandler for DoneHandler {
 /// selection is latency-driven), so relayed traffic stays on a fast
 /// box instead of the throttled public one.
 pub(crate) const FLY_RELAY_URL: &str = "https://relay.pritam.codes";
+/// Host and port the reachability probe dials. Plain TCP is enough:
+/// if the port does not even open, relayed traffic through it cannot
+/// work either.
+pub(crate) const FLY_RELAY_HOST: &str = "relay.pritam.codes";
+pub(crate) const FLY_RELAY_PORT: u16 = 443;
+/// Bounds the whole probe (DNS stalls included): slower than this
+/// counts as unreachable and the fallback map is used instead.
+const RELAY_PROBE_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// Ours alone: used when the probe says our relay answers.
+fn our_relay_map() -> iroh::RelayMap {
+    let url: iroh::RelayUrl = FLY_RELAY_URL
+        .parse()
+        .expect("built-in relay URL must parse");
+    iroh::RelayMap::from_iter([url])
+}
 
 /// Ours plus n0's public relays as fallback: if our relay is down,
-/// relayed traffic degrades instead of failing. Home relay selection
-/// is latency-driven at runtime, so nearby users get ours.
-///
-/// TEMP-TEST ONLY (revert after the ours-only experiment): the n0
-/// fallback is commented out so a Relayed transfer proves our relay
-/// works instead of silently using n0.
+/// relayed traffic degrades instead of failing.
 fn default_relay_map() -> iroh::RelayMap {
-    let urls: Vec<iroh::RelayUrl> = vec![
+    let mut urls: Vec<iroh::RelayUrl> = vec![
         FLY_RELAY_URL
             .parse()
             .expect("built-in relay URL must parse"),
     ];
-    // let fallbacks: Vec<iroh::RelayUrl> = iroh::defaults::prod::default_relay_map().urls();
-    // urls.extend(fallbacks);
-    eprintln!("fly: TEMP TEST — ours-only relay, n0 fallback disabled");
+    let fallbacks: Vec<iroh::RelayUrl> = iroh::defaults::prod::default_relay_map().urls();
+    urls.extend(fallbacks);
     iroh::RelayMap::from_iter(urls)
+}
+
+/// True when something accepts TCP on the relay's port: enough to know
+/// relayed traffic can flow. Runs on a blocking thread (plain std
+/// sockets, so no new dependencies) with a hard outer bound, so slow
+/// DNS or a filtered port degrades instead of hanging a share.
+async fn relay_probe_ok(host: &str, port: u16) -> bool {
+    let host = host.to_owned();
+    let probed = tokio::task::spawn_blocking(move || {
+        use std::net::{TcpStream, ToSocketAddrs};
+        let addr = (host.as_str(), port)
+            .to_socket_addrs()
+            .ok()?
+            .next()?;
+        TcpStream::connect_timeout(&addr, Duration::from_secs(2)).ok()
+    });
+    matches!(
+        tokio::time::timeout(RELAY_PROBE_TIMEOUT, probed).await,
+        Ok(Ok(Some(_)))
+    )
+}
+
+/// Ours alone when it answers, else ours plus the n0 fallback so a down
+/// relay degrades instead of failing the share.
+fn map_for_probe(reachable: bool) -> iroh::RelayMap {
+    if reachable {
+        our_relay_map()
+    } else {
+        default_relay_map()
+    }
+}
+
+/// The relay mode endpoints actually home to: explicit `FLY_RELAY_URL`
+/// wins entirely; otherwise probe ours first and fall back to n0 only
+/// when it does not answer.
+pub(crate) async fn select_relay_map() -> RelayMode {
+    let urls = relay_urls_for(std::env::var("FLY_RELAY_URL").ok().as_deref());
+    if !urls.is_empty() {
+        eprintln!("fly: using custom relays {urls:?}");
+        return RelayMode::Custom(iroh::RelayMap::from_iter(urls));
+    }
+    if relay_probe_ok(FLY_RELAY_HOST, FLY_RELAY_PORT).await {
+        eprintln!("fly: relay reachable, homing to ours alone");
+        RelayMode::Custom(our_relay_map())
+    } else {
+        eprintln!("fly: relay unreachable, using ours plus n0 fallback");
+        RelayMode::Custom(default_relay_map())
+    }
 }
 
 /// Env override for self-hosters: `FLY_RELAY_URL` holds one relay URL
@@ -285,14 +343,6 @@ pub(crate) fn configured_relay_map() -> iroh::RelayMap {
     }
 }
 
-fn relay_mode_for(value: Option<&str>) -> RelayMode {
-    let urls = relay_urls_for(value);
-    if urls.is_empty() {
-        return RelayMode::Custom(default_relay_map());
-    }
-    eprintln!("fly: using custom relays {urls:?}");
-    RelayMode::Custom(iroh::RelayMap::from_iter(urls))
-}
 
 /// The UDP port fly listens on out of the box: nobody configures
 /// anything, and anyone who wants direct connections forwards this one
@@ -323,16 +373,14 @@ fn fixed_port_for(value: Option<&str>) -> Option<u16> {
     }
 }
 
-fn endpoint_builder(port: Option<u16>) -> Result<Builder> {
+fn endpoint_builder(port: Option<u16>, relay_mode: RelayMode) -> Result<Builder> {
     let mut builder = Endpoint::builder(presets::N0)
         .secret_key(SecretKey::generate())
         .alpns(vec![
             iroh_blobs::protocol::ALPN.to_vec(),
             DONE_ALPN.to_vec(),
         ])
-        .relay_mode(relay_mode_for(
-            std::env::var("FLY_RELAY_URL").ok().as_deref(),
-        ))
+        .relay_mode(relay_mode)
         .proxy_from_env()
         // Automatic UPnP/PCP/NAT-PMP mapping: the app asks the router
         // itself to open the fixed port, so home routers yield direct
@@ -375,7 +423,8 @@ pub(crate) async fn build_endpoint() -> Result<Endpoint> {
 /// back). Callers that report the port (the share UI) use this, so a
 /// fallback never advertises a port the app does not hold.
 async fn build_endpoint_with(port: Option<u16>) -> Result<(Endpoint, Option<u16>)> {
-    match endpoint_builder(port)?.bind().await {
+    let relay_mode = select_relay_map().await;
+    match endpoint_builder(port, relay_mode.clone())?.bind().await {
         Ok(endpoint) => {
             if let Some(port) = port {
                 eprintln!(
@@ -388,7 +437,7 @@ async fn build_endpoint_with(port: Option<u16>) -> Result<(Endpoint, Option<u16>
         // retry with an ephemeral port, exactly the old behavior.
         Err(err) if port.is_some() => {
             eprintln!("fly: fixed UDP port unavailable ({err:#}); using a random port");
-            let endpoint = endpoint_builder(None)?
+            let endpoint = endpoint_builder(None, relay_mode)?
                 .bind()
                 .await
                 .context("failed to bind P2P endpoint")?;
@@ -780,48 +829,68 @@ mod tests {
         );
     }
 
-    /// Unset/blank means n0's default relays; a URL means a custom
-    /// single-relay map; garbage warns and falls back instead of
-    /// breaking endpoint creation.
-    /// TEMP-TEST ONLY (revert after the ours-only experiment): the
-    /// default map holds our relay alone. Explicit URLs replace it
-    /// entirely; unset, blank, or all-garbage falls back to it.
-    fn assert_default_map(mode: RelayMode) {
-        match mode {
-            RelayMode::Custom(map) => {
-                let urls = map.urls::<Vec<iroh::RelayUrl>>();
-                // Ours alone for the experiment; home selection is
-                // latency-driven at runtime, so map order is irrelevant.
-                assert_eq!(map.len(), 1, "ours only while n0 is commented out");
-                assert!(
-                    urls.contains(
-                        &"https://relay.pritam.codes".parse().unwrap()
-                    ),
-                    "default map must contain our relay"
-                );
-            }
-            _ => panic!("expected the default ours-plus-n0 map"),
-        }
+    /// Env parsing: unset/blank/all-garbage means empty (the caller
+    /// falls back to the default map); a bare URL means a single custom
+    /// relay; lists build a failover map with blanks and garbage
+    /// skipped instead of breaking endpoint creation.
+    #[test]
+    fn relay_urls_parse() {
+        assert!(relay_urls_for(None).is_empty());
+        assert!(relay_urls_for(Some("")).is_empty());
+        assert!(relay_urls_for(Some("   ")).is_empty());
+        assert!(relay_urls_for(Some("not a url at all !!!")).is_empty());
+        assert_eq!(relay_urls_for(Some("https://relay.example.com")).len(), 1);
+        assert_eq!(
+            relay_urls_for(Some(
+                "https://one.example.com./, , not a url, https://two.example.com./",
+            ))
+            .len(),
+            2
+        );
     }
 
+    /// The full default map holds ours plus the four n0 relays.
     #[test]
-    fn relay_env_selects_map() {
-        assert_default_map(relay_mode_for(None));
-        assert_default_map(relay_mode_for(Some("")));
-        assert_default_map(relay_mode_for(Some("   ")));
-        assert_default_map(relay_mode_for(Some("not a url at all !!!")));
-        match relay_mode_for(Some("https://relay.example.com")) {
-            RelayMode::Custom(map) => assert_eq!(map.len(), 1),
-            _ => panic!("URL must select a custom map"),
-        }
-        // Comma-separated lists build a failover map; blank and
-        // garbage entries are skipped without breaking the rest.
-        match relay_mode_for(Some(
-            "https://one.example.com./, , not a url, https://two.example.com./",
-        )) {
-            RelayMode::Custom(map) => assert_eq!(map.len(), 2),
-            _ => panic!("URL list must select a custom map"),
-        }
+    fn default_map_holds_ours_plus_n0() {
+        let map = default_relay_map();
+        let urls = map.urls::<Vec<iroh::RelayUrl>>();
+        assert_eq!(urls.len(), 5, "ours plus the four n0 relays");
+        assert!(
+            urls.iter().any(|u| u.to_string().contains("relay.pritam.codes")),
+            "default map must contain our relay"
+        );
+    }
+
+    /// The probe decision: reachable means ours alone, unreachable
+    /// means ours plus the n0 fallback.
+    #[test]
+    fn probe_decision_selects_map() {
+        let only = map_for_probe(true);
+        let only_urls = only.urls::<Vec<iroh::RelayUrl>>();
+        assert_eq!(only.len(), 1, "reachable relay needs no fallback");
+        assert!(
+            only_urls[0].to_string().contains("relay.pritam.codes"),
+            "reachable map must be ours alone"
+        );
+        let fallback = map_for_probe(false);
+        assert_eq!(fallback.len(), 5, "unreachable relay keeps n0 fallback");
+    }
+
+    /// The probe itself: a closed loopback port must read unreachable.
+    /// (An open listener would prove the reverse, but this sandbox
+    /// forbids listening sockets while allowing UDP binds, so take a
+    /// free UDP port number and probe it over TCP, which is necessarily
+    /// closed.) Deterministic, no internet needed.
+    #[tokio::test]
+    async fn relay_probe_rejects_closed_port() {
+        let socket =
+            std::net::UdpSocket::bind("127.0.0.1:0").expect("bind loopback UDP");
+        let port = socket.local_addr().expect("local addr").port();
+        drop(socket);
+        assert!(
+            !relay_probe_ok("127.0.0.1", port).await,
+            "closed loopback port must probe unreachable"
+        );
     }
 
     /// Download counts run 1-99; expiry seconds with 0 meaning never.

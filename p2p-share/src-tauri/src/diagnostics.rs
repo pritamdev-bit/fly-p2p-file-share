@@ -142,7 +142,7 @@ mod tests {
             url.starts_with("https://"),
             "relay URL must be absolute, got {url}"
         );
-        assert_eq!(relays.len(), 1, "ours only while n0 is commented out");
+        assert_eq!(relays.len(), 5, "ours plus the four n0 relays");
         assert!(
             relays.iter().any(|r| r.url.contains("relay.pritam.codes")),
             "our relay must be listed even when unprobed"

@@ -28,10 +28,24 @@ export default function Diagnostics({ open, onClose }: Props) {
 
   async function handleCopy() {
     if (!info) return;
+    const shortHost = (url: string) => {
+      try {
+        return new URL(url).hostname.replace(/\.$/, "");
+      } catch {
+        return url;
+      }
+    };
     const text = [
       `node: ${info.nodeId}`,
       `relay reachable: ${info.relayReachable ? "yes" : "no"}`,
       `nat: ${info.natType}`,
+      `home relay: ${info.homeRelay ? shortHost(info.homeRelay) : "none"}`,
+      ...info.relays.map(
+        (r) =>
+          `relay ${shortHost(r.url)}: ${r.latencyMs == null ? "no answer" : `${r.latencyMs} ms`}${
+            r.preferred ? " (preferred)" : ""
+          }`,
+      ),
     ].join("\n");
     try {
       await copyText(text);

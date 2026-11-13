@@ -6,7 +6,7 @@ marked DECIDED.
 
 | # | Decision | Plan default / proposal | Status |
 |---|---|---|---|
-| 1 | Relay tier | Paid Shared/Dedicated or self-hosted (`RelayMode::Custom`, wired to `FLY_RELAY_URL`). Public n0 relays are dev/test-only (rate-limited, no SLA/privacy). | DECIDED — self-hosted on our VPS (`https://relay.pritam.codes`, iroh-relay v1.3.0 on Debian); app default map is ours plus n0 public as fallback; `FLY_RELAY_URL` still fully overrides |
+| 1 | Relay tier | Paid Shared/Dedicated or self-hosted (`RelayMode::Custom`, wired to `FLY_RELAY_URL`). Public n0 relays are dev/test-only (rate-limited, no SLA/privacy). | DECIDED — self-hosted on our VPS (`https://relay.pritam.codes`, iroh-relay v1.3.0 on Debian); app probes ours first and falls back to n0 only when it does not answer; `FLY_RELAY_URL` still fully overrides |
 | 2 | Updater channel | Ship Tauri updater (signatures mandatory; guard `TAURI_SIGNING_PRIVATE_KEY`) or record an explicit no. Until one exists, version checks point at a download page. | PROPOSED |
 | 3 | Node identity lifetime | Ephemeral key per launch (bounds ticket lifetime, no long-term trackable identity). | PROPOSED |
 | 4 | UPnP/NAT-PMP port mapping | Disabled (rely on hole-punching + relay) — or disclose that the app asks the gateway for a port. | DECIDED — enabled (`PortmapperConfig::default`); the app maps its fixed port itself, relay stays as fallback |
